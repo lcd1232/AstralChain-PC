@@ -94,7 +94,7 @@ def build_nvn_objects(compiler, reference, cache, backend='null'):
             raise ValueError('Cached NVN object integrity mismatch')
         return objects,link
     folder.mkdir(parents=True,exist_ok=True)
-    common=[*host.shim_include(),'-I',str(LAS),'-I',str(reference/'runtime')]
+    common=[*host.shim_include(),*host.freetype_include(),'-I',str(LAS),'-I',str(reference/'runtime')]
     if backend=='vulkan':
         prepare_translator(reference,folder/'translator')
         common+=['-I',str(LAS/'shim'),'-I',str(VULKAN_HEADERS),'-I',str(VMA),

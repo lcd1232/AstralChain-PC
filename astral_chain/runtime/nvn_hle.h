@@ -26,6 +26,17 @@ static const struct {const char *name;NvnHostFunction host;} nvn_host_table[]={
 /* Vendored LASRecomp NVN implementations (runtime/las) register through COFF
  * section .hle$m. These markers sort before and after it within .hle. */
 typedef struct {const char *name;NvnHostFunction fn;} NvnLinkedEntry;
+#ifdef __linux__
+/* ELF: no '$' sorting; the entries' section ac_nvn_hle (las/hle.h) is bounded by the linker's symbols. */
+extern const NvnLinkedEntry __start_ac_nvn_hle[] __attribute__((weak)),__stop_ac_nvn_hle[] __attribute__((weak));
+static NvnHostFunction nvn_linked_lookup(const char *name) {
+ const NvnLinkedEntry *first=__start_ac_nvn_hle,*last=__stop_ac_nvn_hle;
+ __asm__("" : "+r"(first), "+r"(last));
+ for(const NvnLinkedEntry *e=first;e && e<last;e++)
+  if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
+ return NULL;
+}
+#else
 __attribute__((used,section(".hle$a"))) static const NvnLinkedEntry nvn_linked_first={0,0};
 __attribute__((used,section(".hle$z"))) static const NvnLinkedEntry nvn_linked_last={0,0};
 static NvnHostFunction nvn_linked_lookup(const char *name) {
@@ -33,6 +44,7 @@ static NvnHostFunction nvn_linked_lookup(const char *name) {
   if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
  return NULL;
 }
+#endif
 /* Bounded NUL-terminated guest string inside one readable region. */
 static int nvn_guest_name(uint64_t address,char *out) {
  if(!address)return 0;
@@ -234,7 +246,16 @@ uint64_t plat_now_ns(void) {
  QueryPerformanceCounter(&now);
  return (uint64_t)((unsigned __int128)now.QuadPart*1000000000u/(uint64_t)frequency.QuadPart);
 }
+#ifdef __linux__
+/* Linux: the kernel's precise absolute sleep on plat_now_ns's clock (QueryPerformanceCounter is CLOCK_MONOTONIC), not
+ * a Sleep(0) spin for the whole wait. */
+void plat_sleep_until_ns(uint64_t t) {
+ struct timespec ts={(time_t)(t/1000000000u),(long)(t%1000000000u)};
+ while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,NULL)==EINTR) {}
+}
+#else
 void plat_sleep_until_ns(uint64_t t) {for(uint64_t now=plat_now_ns();now<t;now=plat_now_ns())Sleep(0);}
+#endif
 /* Background work (texture warm-up decodes, cache saves) below normal priority: it must not delay the game's sound thread. */
 void plat_thread_background(void) {SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);}
 /* Pages of [addr,addr+size) written by the CPU since the last query of them
@@ -458,7 +479,15 @@ void nvn_present_pace(int interval) {
  unsigned others=0;
  for(unsigned i=0;i<33;i++) if(i!=current_thread && guest_threads[i].status!=THREAD_UNUSED &&
     guest_threads[i].status!=THREAD_CREATED && guest_threads[i].status!=THREAD_EXITED) others++;
- if(!others) {kunlock();while(rt_ticks()<target) Sleep(0);return;}
+ if(!others) {
+  kunlock();
+#ifdef __linux__
+  while(rt_ticks()<target) plat_sleep_until_ns((uint64_t)(((__uint128_t)target*1000000000u+19199999)/19200000));
+#else
+  while(rt_ticks()<target) Sleep(0);
+#endif
+  return;
+ }
  guest_threads[current_thread].wake_tick=target;
  guest_threads[current_thread].status=THREAD_SLEEPING;
  (parallel_mode ? 0 : (thread_reschedule=1));

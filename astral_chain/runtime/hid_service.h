@@ -160,10 +160,22 @@ static void hid_xinput(HidSample *sample) {
 /* Test automation: AC_INPUT_SCRIPT="t0-t1:mask;..." holds Switch button mask
  * (bit 0 A ... bit 9 ZR, hex) from t0 to t1 seconds after the first sample.
  * Applies regardless of window focus. */
+/* Test automation, live: AC_INPUT_FILE=<file> holds the button mask (hex, same bits) the file holds, read every
+ * 20 ms; a missing or empty file is no buttons. Applies regardless of window focus. */
+static uint64_t hid_file_buttons(uint64_t now) {
+ static char path[MAX_PATH];static int loaded;static uint64_t checked,mask;
+ if(!loaded) {loaded=1;DWORD n=GetEnvironmentVariableA("AC_INPUT_FILE",path,sizeof(path));if(!n || n>=sizeof(path))path[0]=0;}
+ if(!path[0] || now-checked<384000) return mask;
+ checked=now;
+ unsigned long long m=0;FILE *f=fopen(path,"r");
+ if(f) {if(fscanf(f,"%llx",&m)!=1) m=0;fclose(f);}
+ if(m!=mask) printf("HID file buttons=0x%llx\n",m);
+ mask=m;return mask;
+}
 static uint64_t hid_script_buttons(uint64_t now) {
  static char script[4096];static int loaded;static uint64_t origin;
  if(!loaded) {loaded=1;DWORD n=GetEnvironmentVariableA("AC_INPUT_SCRIPT",script,sizeof(script));if(!n || n>=sizeof(script))script[0]=0;}
- if(!script[0]) return 0;
+ if(!script[0]) return hid_file_buttons(now);
  if(!origin) origin=now;
  double t=(double)(now-origin)/19200000.0;uint64_t mask=0;
  for(const char *p=script;*p;) {
@@ -178,7 +190,7 @@ static uint64_t hid_script_buttons(uint64_t now) {
  }
  static uint64_t last=~0ull;
  if(mask!=last) {printf("HID script t=%.2f buttons=0x%llx\n",t,(unsigned long long)mask);last=mask;}
- return mask;
+ return mask|hid_file_buttons(now);
 }
 static void hid_publish(uint64_t now,int focused) {
  if(!hid_page || !hid_active) return;

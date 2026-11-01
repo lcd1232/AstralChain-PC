@@ -62,7 +62,8 @@ ROMFS_TOOL = host.ROMFS_TOOL
 
 LASRECOMP = PROJECT/'third_party'/'LASRecomp'
 PATCHES = (PROJECT/'third_party'/'AstralChain-Dynamic-FPS'/'1.0.1.pchtxt',
-           PROJECT/'astral_chain'/'patches'/'cutscene-catchup-1.0.1.pchtxt')
+           PROJECT/'astral_chain'/'patches'/'cutscene-catchup-1.0.1.pchtxt',
+           PROJECT/'astral_chain'/'patches'/'movie-sync-1.0.1.pchtxt')
 MAIN_SHA_101 = 'dc47cae835866379c597e1c507bf52ee0f865ec4412930dfdf1bbc20b6bb9c3b'
 PROGRAM_ID = '01007300020fa000'
 FREE_SPACE_GB = 35  # extracted RomFS (~10 GB) + its image (~10 GB) + NCAs + build, before the cleanup
@@ -311,9 +312,19 @@ def build_romfs(inputs, base_program, base_tik, update_program, update_tik):
 
 
 # ---------------------------------------------------------------------------------------------------- 5. build
+def game_language():
+    """AC_LANGUAGE (the Linux launcher's game language): the Switch system language the build answers with; the game
+    shows its text and subtitles in it (or in English when it lacks it). None: native_trace's default."""
+    from .control_meta import LANGUAGES
+    value = os.environ.get('AC_LANGUAGE', '').strip()
+    return value if value in LANGUAGES else None
+
+
 def fingerprint():
-    """Changes to the sources, vendored code or patches make the next launch rebuild."""
+    """Changes to the sources, vendored code or patches make the next launch rebuild (and a chosen game language)."""
     digest = hashlib.sha256()
+    if game_language():
+        digest.update(f'language {game_language()}\n'.encode())
     for root in (PROJECT/'astral_chain', PROJECT/'third_party'):
         for path in sorted(root.rglob('*')):
             if path.is_file() and '__pycache__' not in path.parts and 'data' not in path.relative_to(root).parts[:1]:
@@ -347,6 +358,8 @@ def build_game():
                '--optimize', '--lean', '--direct-calls', '--jumps']
     for patch in PATCHES:
         command += ['--patch', patch]
+    if game_language():
+        command += ['--language', game_language()]
     command.append('--build-only')
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(PROJECT), os.environ.get('PYTHONPATH')])))
     USERDATA.mkdir(parents=True, exist_ok=True)

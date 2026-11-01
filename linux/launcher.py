@@ -42,9 +42,46 @@ def is_steam_deck():
 
 DECK = is_steam_deck()
 
+
+def use_xft_tk():
+    """Load the AppImage's Tk built with Xft (python/lib/tk-xft) before tkinter, if the system has libXft and
+    fontconfig: _tkinter then binds to it by its soname. The Tk of python-build-standalone draws only the bitmap
+    'fixed' font (no Xft) and, with its static libX11, no themed cursor. Without libXft that Tk stays in use."""
+    lib = Path(sys.executable).resolve().parent.parent/'lib'/'tk-xft'/'libtcl9tk9.0.so'
+    if 'tkinter' in sys.modules or '_tkinter' in sys.modules or not lib.is_file():
+        return False
+    import ctypes
+    try:
+        ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+        return True
+    except OSError:
+        return False
+
 # ------------------------------------------------------------------------------------------------ text
-RU = (os.environ.get('LANGUAGE') or os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES') or
-      os.environ.get('LANG') or locale.getlocale()[0] or '').lower().startswith('ru')
+SYSTEM_LOCALE = (os.environ.get('LANGUAGE') or os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES') or
+                 os.environ.get('LANG') or locale.getlocale()[0] or '').lower()
+RU = SYSTEM_LOCALE.startswith('ru')   # (the launcher's language: set_ui_language follows the settings)
+
+
+def set_ui_language(config):
+    global RU
+    choice = config['settings'].get('ui_language', 'auto')
+    RU = SYSTEM_LOCALE.startswith('ru') if choice == 'auto' else choice == 'ru'
+
+
+# The game's text language (menus and subtitles), as the Switch's system language: languages this game has
+GAME_LANGUAGES = (('en-US', 'English'), ('ja', '日本語'), ('fr', 'Français'), ('de', 'Deutsch'), ('es', 'Español'),
+                  ('it', 'Italiano'), ('ru', 'Русский'), ('ko', '한국어'), ('zh-Hant', '繁體中文'), ('zh-Hans', '简体中文'))
+
+
+def system_game_language():
+    lang = SYSTEM_LOCALE.split(':')[0].split('.')[0].replace('-', '_')
+    if lang.startswith('zh'):
+        return 'zh-Hant' if lang.endswith(('_tw', '_hk', '_mo', 'hant')) else 'zh-Hans'
+    for code, _ in GAME_LANGUAGES:
+        if lang[:2] == code[:2]:
+            return code
+    return 'en-US'
 TEXT = {
     'title': ('Astral Chain PC', 'Astral Chain PC'),
     'subtitle': ('Native Linux build from your own dump', 'Нативная сборка для Linux из вашего дампа'),
@@ -64,8 +101,10 @@ TEXT = {
     'st_none': ('Not installed. Pick your files and the install folder, then press Install.',
                 'Не установлено. Выберите свои файлы и папку установки и нажмите «Установить».'),
     'st_ready': ('Ready to play.', 'Готово к игре.'),
-    'st_stale': ('This launcher is newer than the installed build: Play rebuilds the game once (a few minutes).',
-                 'Лаунчер новее установленной сборки: «Играть» один раз пересоберёт игру (несколько минут).'),
+    'st_stale': ('The installed build is out of date (a newer launcher or another game language): Play rebuilds the '
+                 'game once (a minute to a few minutes).',
+                 'Сборка устарела (новая версия лаунчера или другой язык игры): «Играть» один раз пересоберёт игру '
+                 '(от минуты до нескольких минут).'),
     'st_shaders': ('Ready to play (shaders are prepared before the first start).',
                    'Готово к игре (шейдеры подготовятся перед первым запуском).'),
     'st_busy': ('Working...', 'Выполняется...'),
@@ -86,6 +125,10 @@ TEXT = {
     'deck': ('Steam Deck detected: handheld settings are the defaults.',
              'Обнаружен Steam Deck: по умолчанию включены настройки для портативного режима.'),
     'log': ('Log', 'Журнал'),
+    'auto': ('Automatic', 'Автоматически'),
+    'ui_later': ('The launcher\'s language changes when it is opened next time.',
+                 'Язык лаунчера сменится при следующем запуске.'),
+    'group_launcher': ('Launcher', 'Лаунчер'),
     'group_display': ('Display', 'Экран'),
     'group_performance': ('Performance', 'Производительность'),
     'group_game': ('Game', 'Игра'),
@@ -103,6 +146,8 @@ def t(key, **kw):
 # ------------------------------------------------------------------------------------------------ settings
 # key, group, (English, Russian), kind, default, default on the Steam Deck, environment for the game
 OPTIONS = [
+    ('ui_language', 'group_launcher', ('Launcher language', 'Язык лаунчера'),
+     (('auto', 'auto'), ('en', 'English'), ('ru', 'Русский')), 'auto', 'auto', lambda v: {}),
     ('fullscreen', 'group_display', ('Start in fullscreen (F11 / Alt+Enter switches)', 'Запускать в полноэкранном режиме (F11 / Alt+Enter переключает)'),
      'check', '0', '1', lambda v: {'AC_FULLSCREEN': '1'} if v == '1' else {}),
     ('handheld', 'group_display', ('Handheld mode: render at 1280x720 (instead of 1600x900)', 'Портативный режим: рендер 1280x720 (вместо 1600x900)'),
@@ -117,6 +162,10 @@ OPTIONS = [
      'check', '1', '1', lambda v: {} if v == '1' else {'AC_GPU_WARM': '0'}),
     ('bc7', 'group_performance', ('Compress textures on the GPU (BC7: less memory traffic; short pauses while areas load)', 'Сжимать текстуры на GPU (BC7: меньше нагрузка на память; короткие паузы при загрузке зон)'),
      'check', '0', '1', lambda v: {'LARECOMP_BC7': '1'} if v == '1' else {}),
+    ('game_language', 'group_game', ('Game language (text and subtitles; the game is rebuilt once, about a minute)',
+                                     'Язык игры (текст и субтитры; игра один раз пересобирается, около минуты)'),
+     (('auto', 'auto'), *GAME_LANGUAGES), 'auto', 'auto',
+     lambda v: {'AC_LANGUAGE': system_game_language() if v == 'auto' else v}),
     ('cutscene_fps_30', 'group_game', ('Cutscenes at 30 fps, as on the Switch', 'Ролики в 30 fps, как на Switch'),
      'check', '0', '0', lambda v: {'AC_CUTSCENE_FPS': '30'} if v == '1' else {}),
     ('ignore_focus', 'group_game', ('Keep running while the window is minimized', 'Не ставить на паузу при сворачивании окна'),
@@ -138,7 +187,7 @@ OPTIONS = [
     ('pipe_warm', 'group_trouble', ('Build recorded pipelines ahead of their first draw', 'Заранее собирать записанные конвейеры'),
      'check', '1', '1', lambda v: {} if v == '1' else {'LARECOMP_NO_PIPE_WARM': '1'}),
 ]
-SETUP_KEYS = ('gpu_warm', 'gpl')   # these change what the setup's GPU warm-up compiles
+SETUP_KEYS = ('gpu_warm', 'gpl', 'game_language')   # these change what the setup builds or compiles
 
 
 def default_install():
@@ -217,7 +266,24 @@ def game_env(config):
                 name, value = line.split('=', 1)
                 env[name.strip()] = value.strip()
     env.update(option_env(config))
+    if not env.get('AC_FONT') and (font := system_font()):
+        env['AC_FONT'] = font
+    if not env.get('AC_PROMPT_FONT') and (font := system_font(':bold')):
+        env['AC_PROMPT_FONT'] = font
     return env
+
+
+def system_font(style=''):
+    """A TrueType sans face from fontconfig, or None (the game then tries the usual font paths itself): regular for the
+    game's system font (nn::pl shared font: the Switch's own is not in the dump), bold for the key labels on the
+    button icons."""
+    try:
+        out = subprocess.run(['fc-match', '-f', '%{file}|%{fontformat}', f'sans-serif{style}:fontformat=TrueType'],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    path, _, kind = out.partition('|')
+    return path if kind == 'TrueType' and path.lower().endswith(('.ttf', '.ttc')) and Path(path).is_file() else None
 
 
 def run_game(config, log=print):
@@ -359,7 +425,13 @@ class App:
         self.busy = False
         self.process = None
         root.title(t('title'))
-        root.minsize(760, 560)
+        # Tk leaves a window's cursor unset (inherited from the root window); under XWayland the root window's cursor
+        # is empty, so the pointer vanished over everything but text fields. Toplevels, file and message dialogs
+        # and combobox lists get the arrow; their children inherit it.
+        root.configure(cursor='left_ptr')
+        for cls in ('Toplevel', 'TkFDialog', 'TkChooseDir', 'Dialog', 'ComboboxPopdown'):  # (a combobox's list is a toplevel)
+            root.option_add(f'*{cls}.cursor', 'left_ptr')
+        root.minsize(760, 0)
         style = ttk.Style(root)
         if 'clam' in style.theme_names():
             style.theme_use('clam')
@@ -367,13 +439,13 @@ class App:
         base_font = ('Sans', int(11 * scale))
         root.option_add('*Font', base_font)
         style.configure('.', font=base_font)
-        style.configure('Title.TLabel', font=('Sans', int(20 * scale), 'bold'))
         style.configure('Big.TButton', font=('Sans', int(14 * scale), 'bold'), padding=(24, 10))
         style.configure('TButton', padding=(10, 6))
 
         outer = ttk.Frame(root, padding=14)
         outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text=t('title'), style='Title.TLabel').pack(anchor='w')
+        # a font option on the label: the option database's *Font would override the style's
+        ttk.Label(outer, text=t('title'), font=('Sans', int(20 * scale), 'bold')).pack(anchor='w')
         ttk.Label(outer, text=t('subtitle') + (f'  ·  {t("deck")}' if DECK else '')).pack(anchor='w', pady=(0, 10))
 
         form = ttk.Frame(outer)
@@ -406,20 +478,24 @@ class App:
         ttk.Label(outer, textvariable=self.status, wraplength=900).pack(anchor='w')
         self.progress = ttk.Progressbar(outer, mode='indeterminate')
         self.progress.pack(fill='x', pady=(6, 8))
-        ttk.Label(outer, text=t('log')).pack(anchor='w')
-        logframe = ttk.Frame(outer)
-        logframe.pack(fill='both', expand=True)
+        # the log appears with the first line written to it (Install, a failed start), not before
+        self.log_label = ttk.Label(outer, text=t('log'))
+        self.logframe = logframe = ttk.Frame(outer)
         self.log = tk.Text(logframe, height=12, wrap='word', state='disabled', font=('Monospace', int(10 * scale)))
         scroll = ttk.Scrollbar(logframe, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side='left', fill='both', expand=True)
         scroll.pack(side='right', fill='y')
         root.protocol('WM_DELETE_WINDOW', self.on_close)
-        root.after(100, self.poll)
+        self.poll_id = root.after(100, self.poll)
         self.refresh()
 
     # ---- helpers
     def write(self, text):
+        if not self.logframe.winfo_manager():
+            self.log_label.pack(anchor='w')
+            self.logframe.pack(fill='both', expand=True)
+            self.root.minsize(760, 560)
         self.log.configure(state='normal')
         self.log.insert('end', text if text.endswith('\n') else text + '\n')
         self.log.see('end')
@@ -508,7 +584,7 @@ class App:
                         then(code)
         except queue.Empty:
             pass
-        self.root.after(100, self.poll)
+        self.poll_id = self.root.after(100, self.poll)
 
     # ---- actions
     def on_install(self):
@@ -615,16 +691,32 @@ class App:
             values[key] = var
             if kind == 'check':
                 ttk.Checkbutton(frame, text=label, variable=var, onvalue='1', offvalue='0').grid(row=row, column=0, columnspan=2, sticky='w')
+            elif isinstance(kind[0], tuple):  # (value, shown name) pairs: the box shows names, the setting keeps values
+                names = {value: t('auto') if name == 'auto' else name for value, name in kind}
+                shown = tk.StringVar(value=names.get(var.get(), var.get()))
+                ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w')
+                box = ttk.Combobox(frame, textvariable=shown, values=list(names.values()), state='readonly', width=16)
+                box.grid(row=row, column=1, sticky='w', padx=8)
+                box.bind('<<ComboboxSelected>>', lambda _e, var=var, shown=shown, names=names:
+                         var.set(next(v for v, n in names.items() if n == shown.get())))
             else:
                 ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w')
                 ttk.Combobox(frame, textvariable=var, values=list(kind), state='readonly', width=12).grid(row=row, column=1, sticky='w', padx=8)
             row += 1
 
         def save():
+            ui_before = self.config['settings'].get('ui_language')
             for key, var in values.items():
                 self.config['settings'][key] = var.get()
             save_config(self.config)
             dialog.destroy()
+            if self.config['settings'].get('ui_language') != ui_before:
+                if self.busy:
+                    self.write(t('ui_later'))
+                else:
+                    self.rebuild()
+            else:
+                self.refresh()  # (the game language changes what the build is)
         bar = ttk.Frame(frame)
         bar.grid(row=row, column=0, columnspan=2, sticky='e', pady=(14, 0))
         ttk.Button(bar, text=t('save'), command=save).pack(side='right')
@@ -634,11 +726,22 @@ class App:
         self.on_cancel()
         self.root.destroy()
 
+    def rebuild(self):
+        """The window again in the launcher's newly chosen language."""
+        self.root.after_cancel(self.poll_id)
+        set_ui_language(self.config)
+        for child in self.root.winfo_children():
+            child.destroy()
+        App(self.root, self.config)
+
 
 def selftest():
     """No game files needed: the window builds, the setup answers, the toolchain is complete."""
+    xft = use_xft_tk()
     import tkinter as tk
+    import tkinter.font
     config = load_config()
+    set_ui_language(config)
     root = tk.Tk()
     app = App(root, config)
     root.update()
@@ -651,8 +754,11 @@ def selftest():
         if not path.exists():
             problems.append(f'missing {path}')
     state = status(config)
+    font = tkinter.font.Font(family='Sans', size=11).actual('family')
+    if xft and font == 'fixed':
+        problems.append('Xft Tk loaded but fonts are not found')
     root.destroy()
-    print(json.dumps({'status': state, 'deck': DECK, 'problems': problems}))
+    print(json.dumps({'status': state, 'deck': DECK, 'xft': xft, 'font': font, 'problems': problems}))
     return 1 if problems else 0
 
 
@@ -667,6 +773,7 @@ def main():
     parser.add_argument('--selftest', action='store_true')
     args = parser.parse_args()
     config = load_config()
+    set_ui_language(config)
     if args.dest:
         config['install'] = str(Path(args.dest).expanduser().resolve())
         save_config(config)
@@ -686,6 +793,7 @@ def main():
             subprocess.run(setup_command('--rebuild-if-stale'), cwd=CODE, env=base_env(config),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sys.exit(code)
+    use_xft_tk()
     try:
         import tkinter as tk
     except ImportError:

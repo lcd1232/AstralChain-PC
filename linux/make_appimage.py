@@ -5,15 +5,16 @@ on the player's machine. It carries no game data and no code derived from the ga
     python3 linux/make_appimage.py --sdk-only      fill tools/ of this checkout instead (for running from source)
 
 Downloads (pinned by SHA-256, kept in build/appimage-dl; --cache names extra folders to look in first):
-  python-build-standalone 3.14 (with tkinter), Zig 0.17.0, glslang 16.6.0, NSTool 1.9.2, the Steam Runtime 3
+  python-build-standalone 3.14 (with tkinter), Tcl/Tk 9.0.4 sources (Tk is rebuilt with Xft), Zig 0.17.0, glslang 16.6.0, NSTool 1.9.2, the Steam Runtime 3
   "sniper" SDK sysroot (SDL3 and the Vulkan loader: the game targets its glibc 2.31), appimagetool and the static
   type-2 AppImage runtime (no libfuse2 needed on the host).
 
 The AppDir:
   AppRun, astral-chain-pc.desktop, astral-chain.png
-  python/          the interpreter, tkinter, capstone and lz4
+  python/          the interpreter, tkinter, capstone and lz4; lib/tk-xft/ Tk with Xft (see build_tk_xft)
   astral_chain/, third_party/, linux/, launcher/art/, docs/, LICENSE, THIRD_PARTY_NOTICES.md, README.md
-  tools/           zig/, glslang/, nstool/, romfs-build, linux-sdk/ (include/SDL3, lib/libSDL3.so.0, lib/libvulkan.so.1)
+  tools/           zig/, glslang/, nstool/, romfs-build, linux-sdk/ (include/SDL3, freetype/ (headers), lib/libSDL3.so.0,
+                   lib/libvulkan.so.1)
 """
 import argparse
 import hashlib
@@ -40,6 +41,10 @@ PINS = {
     'sniper': (f'https://repo.steampowered.com/steamrt-images-sniper/snapshots/{SNIPER}/'
                'com.valvesoftware.SteamRuntime.Sdk-amd64%2Ci386-sniper-sysroot.tar.gz',
                '8f71947035f97925a311b2ed753f22efcf2f13d6f1631945b8e537f8903ce2cf'),
+    'tcl': ('https://downloads.sourceforge.net/project/tcl/Tcl/9.0.4/tcl9.0.4-src.tar.gz',
+            'd0aed49230bc02a65c1e0229e65f34590a4b037ec40d546f32573b467f7551ea'),
+    'tk': ('https://downloads.sourceforge.net/project/tcl/Tcl/9.0.4/tk9.0.4-src.tar.gz',
+           'd7a146d2917eb8b5cc95276dbf0e3d03c7464d2b19c1675357857c989301dbb4'),
     'appimagetool': ('https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage',
                      '793fca0ce4bcc309dc65d3f66669f58e3755643e4dadbe03932e7b436128494f'),
     'runtime': ('https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64',
@@ -115,22 +120,25 @@ def unpack(archive, destination, prefix='', members=None):
 
 
 def make_sdk(sniper_tar, sdk):
-    """SDL3 headers and library, and the Vulkan loader, from the sniper sysroot; their licenses beside them."""
+    """SDL3 headers and library, the Vulkan loader and FreeType's headers (the game loads the system's libfreetype for
+    its button icons' key labels, las/button_prompts.c) from the sniper sysroot; their licenses beside them."""
     shutil.rmtree(sdk, ignore_errors=True)
     staging = sdk.parent/'sniper-staging'
     shutil.rmtree(staging, ignore_errors=True)
-    wanted = ('usr/include/SDL3/', 'usr/lib/x86_64-linux-gnu/libSDL3.so', 'usr/lib/x86_64-linux-gnu/libvulkan.so',
-              'usr/share/doc/libsdl3-0/copyright', 'usr/share/doc/libvulkan1/copyright')
+    wanted = ('usr/include/SDL3/', 'usr/include/freetype2/', 'usr/lib/x86_64-linux-gnu/libSDL3.so',
+              'usr/lib/x86_64-linux-gnu/libvulkan.so', 'usr/share/doc/libsdl3-0/copyright',
+              'usr/share/doc/libvulkan1/copyright', 'usr/share/doc/libfreetype6/copyright')
     print('== unpacking SDL3 and the Vulkan loader from the Steam Runtime sysroot', flush=True)
     unpack(sniper_tar, staging, members=lambda n: n.lstrip('./').startswith(wanted))
     usr = staging/'usr'
     (sdk/'include').mkdir(parents=True)
     shutil.copytree(usr/'include'/'SDL3', sdk/'include'/'SDL3')
+    shutil.copytree(usr/'include'/'freetype2', sdk/'freetype')  # (ft2build.h, freetype/: apart from SDL3, see host.py)
     (sdk/'lib').mkdir()
     for lib in ('libSDL3.so.0', 'libvulkan.so.1'):
         shutil.copyfile((usr/'lib'/'x86_64-linux-gnu'/lib).resolve(), sdk/'lib'/lib)
     (sdk/'licenses').mkdir()
-    for package in ('libsdl3-0', 'libvulkan1'):
+    for package in ('libsdl3-0', 'libvulkan1', 'libfreetype6'):
         source = usr/'share'/'doc'/package/'copyright'
         if source.is_file():
             shutil.copyfile(source, sdk/'licenses'/f'{package}.copyright')
@@ -148,8 +156,75 @@ def make_tools(tools, caches, dl, sniper=True):
         subprocess.run([str(zig), 'cc', '-O2', '-target', 'x86_64-linux-gnu.2.31', '-I', str(ROOT/'third_party'/'LASRecomp'/'runtime'),
                         str(ROOT/'astral_chain'/'runtime'/'romfs_tool.c'),
                         str(ROOT/'third_party'/'LASRecomp'/'runtime'/'romfs_build.c'), '-o', str(tools/'romfs-build')], check=True)
-    if sniper and not (tools/'linux-sdk'/'lib'/'libSDL3.so.0').is_file():
+    if sniper and not ((tools/'linux-sdk'/'lib'/'libSDL3.so.0').is_file() and (tools/'linux-sdk'/'freetype'/'ft2build.h').is_file()):
         make_sdk(fetch('sniper', caches, dl), tools/'linux-sdk')
+
+
+def build_tk_xft(python, tools, caches, dl):
+    """Tk 9.0.4 (the version python-build-standalone carries) built with Xft, into python/lib/tk-xft/.
+
+    python-build-standalone links Tk with a static libX11 and without Xft: only the bitmap 'fixed' font (no sizes, no
+    bold), and no themed mouse cursor (under XWayland none at all). This Tk uses the system's libX11, libXft,
+    fontconfig and libXss, headers from the sniper sysroot, glibc 2.31 through Zig. It has the soname
+    libtcl9tk9.0.so and no runpath; launcher.py loads it before tkinter when the system can (else the original stays).
+    Nothing from the sysroot is shipped: an older libXft (< 2.3.5) breaks on colour emoji fonts, and an older
+    fontconfig does not read newer configuration."""
+    out = python/'lib'/'tk-xft'
+    stamp = f"{PINS['tcl'][1]} {PINS['tk'][1]} {PINS['sniper'][1]}"
+    cached = ROOT/'build'/'appimage'/'tk-xft'
+    if (cached/'stamp').is_file() and (cached/'stamp').read_text() == stamp:
+        shutil.copytree(cached, out, ignore=shutil.ignore_patterns('stamp'), dirs_exist_ok=True)
+        return
+    print('== Tk with Xft', flush=True)
+    pkg_config = shutil.which('pkg-config')
+    if not pkg_config:
+        raise SystemExit('pkg-config is needed to build Tk with Xft')
+    work = ROOT/'build'/'appimage'/'tk-build'
+    shutil.rmtree(work, ignore_errors=True)
+    sysroot = work/'sysroot'
+    lib = 'usr/lib/x86_64-linux-gnu/'
+    wanted = (*(f'usr/include/{d}/' for d in ('X11', 'fontconfig', 'freetype2')), lib + 'pkgconfig/', 'usr/share/pkgconfig/',
+              *(f'{lib}lib{n}.so' for n in ('X11', 'Xft', 'fontconfig', 'freetype', 'Xss', 'Xext', 'Xrender')))
+    unpack(fetch('sniper', caches, dl), sysroot, members=lambda n: n.lstrip('./').startswith(wanted))
+    # only these headers: the sysroot's glibc headers must not shadow Zig's
+    inc = work/'include'
+    inc.mkdir()
+    for d in ('X11', 'fontconfig', 'freetype2'):
+        (inc/d).symlink_to(sysroot/'usr'/'include'/d)
+    unpack(fetch('tcl', caches, dl), work/'tcl')
+    unpack(fetch('tk', caches, dl), work/'tk')
+    tcl_unix, tk_unix = work/'tcl'/'tcl9.0.4'/'unix', work/'tk'/'tk9.0.4'/'unix'
+    zig = tools/'zig'/'zig'
+    bin_dir = work/'bin'
+    bin_dir.mkdir()
+    (bin_dir/'cc').write_text(f'#!/bin/sh\nexec "{zig}" cc -target x86_64-linux-gnu.2.31 "$@"\n')
+    # Tk's configure asks pkg-config for xft: answer from the sysroot, with the include folder above
+    pc = f"{sysroot/'usr'/'lib'/'x86_64-linux-gnu'/'pkgconfig'}:{sysroot/'usr'/'share'/'pkgconfig'}"
+    (bin_dir/'pkg-config').write_text(
+        '#!/bin/sh\n'
+        f'out=$(PKG_CONFIG_LIBDIR="{pc}" PKG_CONFIG_SYSROOT_DIR="{sysroot}" "{pkg_config}" "$@") || exit $?\n'
+        f'printf \'%s\\n\' "$out" | sed -e \'s#-I{sysroot}/usr/include/freetype2#-I{inc}/freetype2#g; '
+        f's#-I{sysroot}/usr/include/[^ ]*##g; s#-I{sysroot}/usr/include#-I{inc}#g\'\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", CC=str(bin_dir/'cc'),
+               AR=f'{zig} ar', RANLIB=f'{zig} ranlib')
+    jobs = f'-j{os.cpu_count() or 4}'
+    run = lambda cmd, cwd: subprocess.run(cmd, cwd=cwd, env=env, check=True, stdout=subprocess.DEVNULL)
+    run(['./configure', '--enable-shared'], tcl_unix)
+    run(['make', jobs, 'libtclstub.a'], tcl_unix)
+    run(['./configure', f'--with-tcl={tcl_unix}', '--enable-shared', '--enable-xft', '--enable-xss',
+         f'--x-includes={inc}', f'--x-libraries={sysroot/"usr"/"lib"/"x86_64-linux-gnu"}'], tk_unix)
+    run(['make', jobs, 'libtcl9tk9.0.so', 'LD_SEARCH_FLAGS=-Wl,-soname,libtcl9tk9.0.so',
+         'LDFLAGS=-Wl,--export-dynamic -Wl,-s'], tk_unix)
+    shutil.rmtree(cached, ignore_errors=True)
+    cached.mkdir(parents=True)
+    shutil.copyfile(tk_unix/'libtcl9tk9.0.so', cached/'libtcl9tk9.0.so')
+    (cached/'libtcl9tk9.0.so').chmod(0o755)
+    shutil.copyfile(tk_unix.parent/'license.terms', cached/'license.terms')
+    (cached/'stamp').write_text(stamp)
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(cached, out, ignore=shutil.ignore_patterns('stamp'), dirs_exist_ok=True)
 
 
 def icon_png(ico, out):
@@ -206,6 +281,7 @@ def make_appdir(appdir, caches, dl):
     shutil.copytree(ROOT/'launcher'/'art', appdir/'launcher'/'art')
     print('== tools', flush=True)
     make_tools(appdir/'tools', caches, dl)
+    build_tk_xft(appdir/'python', appdir/'tools', caches, dl)
     (appdir/'AppRun').write_text(APPRUN)
     (appdir/'AppRun').chmod(0o755)
     (appdir/'astral-chain-pc.desktop').write_text(DESKTOP)

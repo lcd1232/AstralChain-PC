@@ -47,6 +47,12 @@ def shim_include():
     return ['-I', str(POSIX)] if LINUX else []
 
 
+def freetype_include():
+    """FreeType's headers (TOOLS/linux-sdk/freetype) for the button icons' key labels (las/button_prompts.c, which loads
+    the system's libfreetype at run time); in a folder of their own, so the NVN layer's SDL3 shim stays the only SDL3."""
+    return ['-isystem', str(SDK/'freetype')] if LINUX else []
+
+
 def vulkan_library():
     """Link input for the Vulkan loader on Linux (the SDK's libvulkan.so.1)."""
     return SDK/'lib'/'libvulkan.so.1'

@@ -100,6 +100,7 @@ static void fill_arrow(Canvas *cv, float cx, float cy, float s, int d, uint8_t v
         }
 }
 
+#ifndef __linux__
 /* ------------------------------------------------------------------------------------------------- text (GDI) */
 /* gdi32 is loaded at run time (the game's link line has no gdi32; app_window.h does the same for StretchDIBits). */
 static struct {
@@ -177,6 +178,88 @@ static void cut_text(Canvas *cv, const wchar_t *text, float bx0, float by0, floa
     gdi.DeleteObject(bmp);
     gdi.DeleteDC(dc);
 }
+#else
+/* --------------------------------------------------------------------------------------------- text (FreeType) */
+/* Linux: the system's libfreetype, loaded at run time (nothing to link; without it the keys stay blank), with a bold
+ * TrueType face: AC_PROMPT_FONT (the launcher passes fontconfig's), else the usual paths. The same fitting and
+ * placement as the GDI version, unantialiased like it. */
+#include <dlfcn.h>
+#include <wchar.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+static struct {
+    FT_Error (*Init_FreeType)(FT_Library *);
+    FT_Error (*New_Face)(FT_Library, const char *, FT_Long, FT_Face *);
+    FT_Error (*Set_Pixel_Sizes)(FT_Face, FT_UInt, FT_UInt);
+    FT_Error (*Load_Char)(FT_Face, FT_ULong, FT_Int32);
+    FT_Face face;
+} ft;
+
+static bool ft_load(void) {
+    static int state;
+    if (state) return state > 0;
+    state = -1;
+    void *m = dlopen("libfreetype.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!m) { printf("[prompts] libfreetype.so.6 not found: key labels left blank\n"); return false; }
+    *(void **)&ft.Init_FreeType = dlsym(m, "FT_Init_FreeType");
+    *(void **)&ft.New_Face = dlsym(m, "FT_New_Face");
+    *(void **)&ft.Set_Pixel_Sizes = dlsym(m, "FT_Set_Pixel_Sizes");
+    *(void **)&ft.Load_Char = dlsym(m, "FT_Load_Char");
+    FT_Library library;
+    if (!ft.Init_FreeType || !ft.New_Face || !ft.Set_Pixel_Sizes || !ft.Load_Char || ft.Init_FreeType(&library)) return false;
+    const char *paths[] = {getenv("AC_PROMPT_FONT"),
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        getenv("AC_FONT")};
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        if (paths[i] && paths[i][0] && !ft.New_Face(library, paths[i], 0, &ft.face)) {
+            printf("[prompts] key labels in %s\n", paths[i]);
+            state = 1;
+            return true;
+        }
+    }
+    printf("[prompts] no font for the key labels: left blank\n");
+    return false;
+}
+
+/* Cuts text out of the shape (coverage 0 where the glyphs are), centred in the box, as large as fits. */
+static void cut_text(Canvas *cv, const wchar_t *text, float bx0, float by0, float bx1, float by1) {
+    if (!ft_load()) return;
+    int n = (int)wcslen(text), bw = (int)(bx1 - bx0), bh = (int)(by1 - by0);
+    if (n == 0 || bw < 4 || bh < 4) return;
+    /* largest font height (em, as GDI's negative height) whose text fits the box */
+    int height = bh, fitted = 0, width = 0, ascent = 0, cell = 0;
+    for (; height >= 6; height = height * 9 / 10) {
+        if (ft.Set_Pixel_Sizes(ft.face, 0, (FT_UInt)height)) return;
+        ascent = (int)(ft.face->size->metrics.ascender >> 6);
+        cell = ascent + (int)(-ft.face->size->metrics.descender >> 6);
+        width = 0;
+        for (int i = 0; i < n; i++)
+            if (!ft.Load_Char(ft.face, (FT_ULong)text[i], FT_LOAD_DEFAULT)) width += (int)(ft.face->glyph->advance.x >> 6);
+        if (width <= bw && cell <= bh * 1.45f) { fitted = 1; break; }
+    }
+    if (!fitted) return;
+    /* (centred on the cell, nudged up a little, as the GDI version) */
+    int pen = (int)(bx0 + (bw - width) / 2.0f), baseline = (int)(by0 + (bh - cell) / 2.0f + cell * 0.02f) + ascent;
+    for (int i = 0; i < n; i++) {
+        if (ft.Load_Char(ft.face, (FT_ULong)text[i], FT_LOAD_RENDER | FT_LOAD_TARGET_MONO)) continue;
+        FT_GlyphSlot g = ft.face->glyph;
+        const FT_Bitmap *b = &g->bitmap;
+        for (unsigned row = 0; row < b->rows; row++) {
+            const unsigned char *line = b->buffer + (ptrdiff_t)row * b->pitch;
+            for (unsigned col = 0; col < b->width; col++) {
+                int on = b->pixel_mode == FT_PIXEL_MODE_MONO ? (line[col >> 3] >> (7 - (col & 7))) & 1 : line[col] >= 128;
+                int x = pen + g->bitmap_left + (int)col, y = baseline - g->bitmap_top + (int)row;
+                if (on && x >= 0 && y >= 0 && x < cv->w && y < cv->h) cv->c[(size_t)y * cv->w + x] = 0;
+            }
+        }
+        pen += (int)(g->advance.x >> 6);
+    }
+}
+#endif
 
 /* ------------------------------------------------------------------------------------------------------- glyphs */
 static const wchar_t *key_label(unsigned vk, wchar_t buf[8]) {

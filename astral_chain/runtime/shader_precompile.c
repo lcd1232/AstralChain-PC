@@ -21,6 +21,13 @@
 #include <windows.h>
 #include "shader.h"
 
+// path separator of the paths built here: read_file opens them with the C library's fopen, which on Linux takes no '\\'
+#ifdef __linux__
+#define SEP "/"
+#else
+#define SEP "\\"
+#endif
+
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords);
 void rt_log(const char *format, ...) {
     va_list args;
@@ -57,26 +64,26 @@ static void load_codes(const char *folder) {
     char pattern[MAX_PATH];
     {   // subfolders first (one per DAT)
         WIN32_FIND_DATAA fd;
-        snprintf(pattern, sizeof pattern, "%s\\*", folder);
+        snprintf(pattern, sizeof pattern, "%s" SEP "*", folder);
         HANDLE h = FindFirstFileA(pattern, &fd);
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
                 char sub[MAX_PATH];
-                snprintf(sub, sizeof sub, "%s\\%s", folder, fd.cFileName);
+                snprintf(sub, sizeof sub, "%s" SEP "%s", folder, fd.cFileName);
                 load_codes(sub);
             } while (FindNextFileA(h, &fd));
             FindClose(h);
         }
     }
-    snprintf(pattern, sizeof pattern, "%s\\*.code", folder);
+    snprintf(pattern, sizeof pattern, "%s" SEP "*.code", folder);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         char path[MAX_PATH], cpath[MAX_PATH];
-        snprintf(path, sizeof path, "%s\\%s", folder, fd.cFileName);
-        snprintf(cpath, sizeof cpath, "%s\\%.*s.control", folder, (int)(strlen(fd.cFileName) - 5), fd.cFileName);
+        snprintf(path, sizeof path, "%s" SEP "%s", folder, fd.cFileName);
+        snprintf(cpath, sizeof cpath, "%s" SEP "%.*s.control", folder, (int)(strlen(fd.cFileName) - 5), fd.cFileName);
         size_t size = 0, csize = 0;
         uint8_t *code = read_file(path, &size), *control = read_file(cpath, &csize);
         if (!code || !control || csize < 0x704) { free(code); free(control); continue; }

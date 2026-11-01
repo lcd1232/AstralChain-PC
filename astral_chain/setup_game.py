@@ -23,18 +23,21 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import zipfile
 
-PROJECT = Path(__file__).resolve().parent.parent
-TOOLS = PROJECT/'tools'
-GAME = PROJECT/'game'
+from . import host
+
+PROJECT = host.CODE          # the sources (read-only in the Linux AppImage)
+TOOLS = host.TOOLS
+GAME = host.HOME/'game'      # the install: the extracted game data, the build and the saves
 WORK = GAME/'work'
-BUILD = PROJECT/'build'
-USERDATA = PROJECT/'userdata'
+BUILD = host.HOME/'build'
+USERDATA = host.HOME/'userdata'
 SETTINGS = USERDATA/'setup.json'
 
-DOWNLOADS = {
+DOWNLOADS_WINDOWS = {
     'zig': ('https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip',
             'b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428', 'zig-x86_64-windows-0.17.0/'),
     'glslang': ('https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip',
@@ -42,10 +45,20 @@ DOWNLOADS = {
     'nstool': ('https://github.com/jakcron/nstool/releases/download/v1.9.2/nstool-v1.9.2-win_x64.zip',
                '34659dc47249a3c00f7fc88a11f4e5ba14dfbec0a6a96b4f3f71368a7e1c9374', ''),
 }
-ZIG = TOOLS/'zig'/'zig.exe'
-NSTOOL = TOOLS/'nstool'/'nstool.exe'
-GLSLANG = TOOLS/'glslang'/'bin'/'glslang.exe'
-ROMFS_TOOL = TOOLS/'romfs-build.exe'
+# (Linux: the AppImage carries these, and the SDK folder (SDL3, Vulkan loader) built by linux/make_appimage.py)
+DOWNLOADS_LINUX = {
+    'zig': ('https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz',
+            '1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026', 'zig-x86_64-linux-0.17.0/'),
+    'glslang': ('https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.zip',
+                'a3fc4f083b1793eb53e55fa3577ac9649ffbe0340715e30d116290fb5382393f', ''),
+    'nstool': ('https://github.com/jakcron/nstool/releases/download/v1.9.2/nstool-v1.9.2-ubuntu_x86_64.zip',
+               '2ab1d484d79199d1bb428cb920a49cece0ae4d7129c80120eaf48b7361785351', ''),
+}
+DOWNLOADS = DOWNLOADS_LINUX if host.LINUX else DOWNLOADS_WINDOWS
+ZIG = host.ZIG
+NSTOOL = host.NSTOOL
+GLSLANG = host.GLSLANG
+ROMFS_TOOL = host.ROMFS_TOOL
 
 LASRECOMP = PROJECT/'third_party'/'LASRecomp'
 PATCHES = (PROJECT/'third_party'/'AstralChain-Dynamic-FPS'/'1.0.1.pchtxt',
@@ -85,7 +98,7 @@ def fetch_tools():
             continue
         step(f'Downloading {name}')
         TOOLS.mkdir(exist_ok=True)
-        archive = TOOLS/f'{name}.zip'
+        archive = TOOLS/f'{name}.download'
         with urllib.request.urlopen(url, timeout=120) as response, open(archive, 'wb') as out:
             shutil.copyfileobj(response, out)
         if sha256(archive) != digest:
@@ -93,22 +106,36 @@ def fetch_tools():
             raise SetupError(f'{name}: the download does not match its pinned SHA-256 ({url})')
         partial = TOOLS/f'{name}.partial'
         shutil.rmtree(partial, ignore_errors=True)
-        with zipfile.ZipFile(archive) as z:
-            for member in z.infolist():
-                if not member.filename.startswith(prefix) or member.is_dir():
-                    continue
-                relative = member.filename[len(prefix):]
-                destination = (partial/relative).resolve()
-                if partial.resolve() not in destination.parents:
-                    raise SetupError(f'{name}: unexpected path in the archive: {member.filename}')
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with z.open(member) as source, open(destination, 'wb') as out:
-                    shutil.copyfileobj(source, out)
+        def place(member_name, opener):
+            if not member_name.startswith(prefix):
+                return
+            relative = member_name[len(prefix):]
+            destination = (partial/relative).resolve()
+            if partial.resolve() not in destination.parents:
+                raise SetupError(f'{name}: unexpected path in the archive: {member_name}')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with opener() as source, open(destination, 'wb') as out:
+                shutil.copyfileobj(source, out)
+            if host.LINUX:
+                destination.chmod(0o755)
+        if url.endswith('.zip'):
+            with zipfile.ZipFile(archive) as z:
+                for member in z.infolist():
+                    if not member.is_dir():
+                        place(member.filename, lambda m=member: z.open(m))
+        else:
+            with tarfile.open(archive) as t:
+                for member in t.getmembers():
+                    if member.isfile():
+                        place(member.name, lambda m=member: t.extractfile(m))
         partial.rename(target)
         archive.unlink()
+    if host.LINUX and not (host.SDK/'lib'/'libSDL3.so.0').is_file():
+        raise SetupError(f'The Linux SDK (SDL3 and the Vulkan loader) is missing from {host.SDK}. '
+                         'Use the AppImage, or make the folder with linux/make_appimage.py --sdk-only.')
     if not ROMFS_TOOL.is_file():
         step('Building the RomFS packer')
-        run([ZIG, 'cc', '-O2', '-target', 'x86_64-windows-gnu', '-I', LASRECOMP/'runtime',
+        run([ZIG, 'cc', '-O2', *host.target(), '-I', LASRECOMP/'runtime',
              PROJECT/'astral_chain'/'runtime'/'romfs_tool.c', LASRECOMP/'runtime'/'romfs_build.c', '-o', ROMFS_TOOL])
 
 
@@ -312,6 +339,7 @@ def build_game():
         shutil.rmtree(old, ignore_errors=True)
         GAME_BUILD.rename(old)
     command = [sys.executable, '-m', 'astral_chain.native_trace', UPDATE_EXEFS,
+               '--account-profile', USERDATA/'account.json',
                '--reference', LASRECOMP, '--compiler', ZIG, '--output', GAME_BUILD,
                '--instructions', '4000000', '--sample-steps', '0', '--run-timeout', '86400', '--unbounded', '--chain',
                '--follow', '0', '--entry', 'rtld:start', '--seed-all-text', '--build', 'cached',
@@ -320,7 +348,9 @@ def build_game():
     for patch in PATCHES:
         command += ['--patch', patch]
     command.append('--build-only')
-    result = subprocess.run([str(c) for c in command], cwd=PROJECT)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(PROJECT), os.environ.get('PYTHONPATH')])))
+    USERDATA.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run([str(c) for c in command], cwd=host.HOME, env=env)
     if result.returncode or not (GAME_BUILD/'round-00'/'trace.exe').is_file():
         raise SetupError('The game build failed (see the messages above).')
     FINGERPRINT.write_text(fingerprint() + '\n', encoding='ascii')
@@ -340,6 +370,9 @@ def prepare_bc7():
     Used by the game with LARECOMP_BC7=1; textures not found there are converted on the GPU."""
     if os.environ.get('AC_BC7_PRECOMPUTE') != '1':
         return
+    if host.LINUX:
+        print('  BC7 textures prepared at setup are not available on Linux yet; the game converts them on the GPU.')
+        return
     from . import bc7_cache
     out = GAME_BUILD/'cache'/'bc7'
     stamp = out/'complete.txt'
@@ -347,7 +380,7 @@ def prepare_bc7():
     if stamp.is_file() and stamp.read_text(encoding='ascii').strip() == want:
         return
     step('Preparing BC7 textures (about 12 minutes and 16 GB of disk space, once)')
-    free = shutil.disk_usage(PROJECT).free / 1e9
+    free = shutil.disk_usage(host.HOME).free / 1e9
     if free < 20:
         print(f'  Skipped: about 20 GB free disk space needed ({free:.0f} GB free). The game converts its textures on '
               'the GPU instead.')
@@ -403,9 +436,10 @@ def main():
             prepare_shaders()
             prepare_bc7()
             return
-        GAME.mkdir(exist_ok=True)
+        GAME.mkdir(parents=True, exist_ok=True)
         if not game_data_ready():
-            free = shutil.disk_usage(PROJECT).free / 1e9
+            host.HOME.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(host.HOME).free / 1e9
             if free < FREE_SPACE_GB:
                 raise SetupError(f'Setup needs about {FREE_SPACE_GB} GB free on this drive ({free:.0f} GB free).')
         fetch_tools()
@@ -422,7 +456,8 @@ def main():
         build_game()
         prepare_shaders()
         prepare_bc7()
-        print('\nSetup complete. Start the game with the launcher (or "Play Astral Chain.cmd").')
+        print('\nSetup complete. Start the game with the launcher' +
+              ('.' if host.LINUX else ' (or "Play Astral Chain.cmd").'))
     except SetupError as error:
         print(f'\nSetup stopped: {error}', file=sys.stderr)
         sys.exit(1)

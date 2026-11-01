@@ -416,10 +416,18 @@ void *nvn_host_window(void) {
 }
 /* Display pacing: 60 Hz vsync grid in rt_ticks (19.2 MHz). Each present waits for
  * the first vsync at least `interval` refreshes after the previous present.
- * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1). */
+ * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1).
+ * AC_FPS_LIMIT=<20..60> paces on a grid of that rate instead of 60 Hz (a steady 40 fps on handhelds such as the
+ * Steam Deck; the game's step follows the measured frame time, so it runs at the right speed). */
 void nvn_present_pace(int interval) {
  static int override=-2;
- if(override==-2) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;}
+ static uint64_t period=320000; /* 19.2 MHz / 60 Hz */
+ if(override==-2) {
+  char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;
+  n=GetEnvironmentVariableA("AC_FPS_LIMIT",v,sizeof(v));
+  int limit=n && n<sizeof(v) ? atoi(v) : 60;
+  if(limit>=20 && limit<60) {period=19200000ull/(uint64_t)limit;printf("NVN frame limit %d fps\n",limit);}
+ }
  static unsigned presents;
  if(!(++presents%60)) {fflush(stdout);fflush(stderr);} /* long runs end by timeout; keep the log current */
  static int logged_interval=-1;
@@ -427,10 +435,9 @@ void nvn_present_pace(int interval) {
  if(override>=0) interval=override;
  /* AC_CUTSCENE_FPS=30: cutscenes at 30 FPS, as in the unmodified game (svc #0xB1 in host_runtime.c.in). */
  extern int cutscene_mode;
- if(cutscene_mode && interval>0 && interval<2) interval=2;
+ if(cutscene_mode && interval>0 && interval<2 && period==320000) interval=2;
  if(interval<=0) return;
  static uint64_t origin,last_vsync;
- const uint64_t period=320000; /* 19.2 MHz / 60 Hz */
  uint64_t now=rt_ticks();
  if(!origin) {origin=now;last_vsync=0;return;}
  /* Adaptive: a frame that missed its slot (last + interval) is shown at once
@@ -585,6 +592,7 @@ static void prof_attach(unsigned thread) {
  if((int)thread!=wanted || !GetEnvironmentVariableA("AC_PROFILE",NULL,0)) return;
  if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&prof_target,THREAD_ALL_ACCESS,FALSE,0)) return;
  {ULONG_PTR low,high;GetCurrentThreadStackLimits(&low,&high);prof_stack_low=low;prof_stack_high=high;
+#ifndef WIN32_POSIX  /* (Linux: the image is ELF; samples are recorded without their caller) */
   const uint8_t *image=(const uint8_t *)GetModuleHandleA(NULL);
   const IMAGE_NT_HEADERS64 *nt=(const IMAGE_NT_HEADERS64 *)(image+((const IMAGE_DOS_HEADER *)image)->e_lfanew);
   /* The executable sections only: data pointers on the stack are not return addresses. */
@@ -593,7 +601,9 @@ static void prof_attach(unsigned thread) {
    uint64_t lo=(uint64_t)(uintptr_t)image+sec[i].VirtualAddress,hi=lo+sec[i].Misc.VirtualSize;
    if(!prof_image_low || lo<prof_image_low) prof_image_low=lo;
    if(hi>prof_image_high) prof_image_high=hi;
-  }}
+  }
+#endif
+ }
  HANDLE t=CreateThread(NULL,0,prof_thread,NULL,0,NULL);if(t)CloseHandle(t);
  printf("PROFILE sampling the host thread of guest thread %u\n",thread);
 }

@@ -3,6 +3,7 @@ from pathlib import Path
 import struct
 from .account_profile import validate_profile
 from .containers import FormatError
+from . import host
 
 
 def save_configuration(process, control, profile, profile_path):
@@ -20,7 +21,8 @@ def save_configuration(process, control, profile, profile_path):
     identity = struct.pack('<8sQQ16sQQQ', b'ACPCSAV1', application_id,
                            control['save_owner_id'], bytes.fromhex(profile['uid']),
                            control['user_save_size'], control['user_journal_size'], 0)
-    return {'root':str(root), 'identity':identity.hex(), 'application_id':application_id,
+    # (Linux: Z:\... - the save code requires a drive letter; the Win32 subset maps it to the root)
+    return {'root':host.windows_path(root), 'identity':identity.hex(), 'application_id':application_id,
             'data_capacity':control['user_save_size'], 'journal_capacity':control['user_journal_size']}
 
 

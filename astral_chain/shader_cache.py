@@ -124,7 +124,10 @@ def extract_shaders(romfs: Path, out: Path) -> int:
 
 def tool_digest() -> str:
     """Identity of shader_precompile.exe: its sources and the translator patches."""
-    digest = hashlib.sha256()
+    from . import host
+    digest = hashlib.sha256(host.TARGET.encode())
+    for path in (*sorted(host.POSIX.glob('*')),) if host.LINUX else ():
+        digest.update(path.read_bytes())
     for path in TOOL_SOURCES + (PROJECT/'astral_chain'/'shader_build.py', RUNTIME/'las'/'las_compat.h',
                                 LASRECOMP/'runtime'/'nvn'/'maxwell'/'translate.c'):
         digest.update(path.read_bytes())
@@ -139,10 +142,11 @@ def build_tool(zig: Path, build: Path) -> Path:
         return exe
     translator = prepare_translator(LASRECOMP, folder/'translator')
     las = RUNTIME/'las'
-    command = [str(zig), 'cc', '-target', 'x86_64-windows-gnu', '-O2', '-include', str(las/'las_compat.h'),
+    from . import host
+    command = [str(zig), 'cc', *host.target(), '-O2', *host.shim_include(), '-include', str(las/'las_compat.h'),
                '-I', str(las), '-I', str(las/'shim'), '-I', str(LASRECOMP/'runtime'),
                '-I', str(LASRECOMP/'runtime'/'nvn'/'maxwell'), *map(str, TOOL_SOURCES), str(translator),
-               '-Wl,--stack,67108864', '-o', str(exe)]
+               *host.main_flags(), *host.link_flags(zig, build/'native-objects', folder, main=True), '-o', str(exe)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError('shader precompiler build failed:\n' + result.stdout + result.stderr)

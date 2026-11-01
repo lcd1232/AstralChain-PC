@@ -16,6 +16,7 @@ import sys
 from time import perf_counter
 
 from .containers import FormatError
+from . import host
 from .linker import LinkedImage
 from .native_probe import ACCEPTED_MAIN_SHAS, LAS_COMMIT, MODULE_SHAS, verify_reference
 from .runtime_memory import MemoryMap, STACK_BASE, TLS_BASE, TLS_SIZE
@@ -374,7 +375,7 @@ def main():
     if args.optimize:
         # Shared list: native_build and nvn_build key their caches on it.
         from . import native_build
-        native_build.FLAGS[:]=['-target','x86_64-windows-gnu','-O2','-mcpu=x86_64_v3','-mcx16']
+        native_build.FLAGS[:]=[*host.target(),'-O2','-mcpu=x86_64_v3','-mcx16']
     if args.nvn_backend and not args.nvn_hle:
         parser.error('--nvn-backend requires --nvn-hle')
     if args.build=='cached' and args.dispatch!='pages':
@@ -523,8 +524,9 @@ execute(c); return 0; }}
         folder = output/f'round-{iteration:02d}'
         folder.mkdir()
         (folder/'trace.c').write_text(source, encoding='utf-8')
-        command = [str(args.compiler.resolve()), 'cc', '-target', 'x86_64-windows-gnu', '-O1','-mcx16',
-                   '-I', str(Path(__file__).parent/'runtime'), '-I', str(reference/'runtime'), str(folder/'trace.c'), *(str(o) for o in nvn_objects), *nvn_link, '-lbcrypt', '-luser32', '-o', str(folder/'trace.exe')]
+        command = [str(args.compiler.resolve()), 'cc', *host.target(), '-O1','-mcx16', *host.shim_include(),
+                   '-I', str(Path(__file__).parent/'runtime'), '-I', str(reference/'runtime'), *host.main_flags(), str(folder/'trace.c'), *(str(o) for o in nvn_objects), *nvn_link,
+                   *host.link_flags(args.compiler,output.parent/'native-objects',folder,main=True), '-o', str(folder/'trace.exe')]
         compile_started=perf_counter()
         try:
             if units is not None:
@@ -570,7 +572,7 @@ execute(c); return 0; }}
                 if args.nvn_backend=='vulkan':
                     run_env['AC_GLSLANG']=str(GLSLANG)
                 run_env['AC_HLE_SYMBOLS']=';'.join(f'{name}={image.symbols[name][0]:#x}' for name in HLE_SYMBOLS if name in image.symbols)
-                fonts=Path(__file__).resolve().parent.parent/'userdata/fonts'
+                fonts=host.HOME/'userdata/fonts'
                 for variable,stems in (('AC_FONT',('nintendo_udsg-r_std_003','nintendo_udsgr_std_003')),('AC_FONT_EXT',('nintendo_ext_003',))):
                     found=[fonts/f'{stem}{suffix}' for stem in stems for suffix in ('.bfttf','.ttf') if (fonts/f'{stem}{suffix}').is_file()]
                     if found:

@@ -48,3 +48,15 @@ build time by `astral_chain/shader_build.py`. The vendored file itself is unchan
 
 [Capstone](https://www.capstone-engine.org/) (BSD-3-Clause), [python-lz4](https://github.com/python-lz4/python-lz4)
 (BSD-3-Clause).
+
+## Linux build
+
+| Component | Where | License |
+| --- | --- | --- |
+| [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) write-watch code (userfaultfd + `PAGEMAP_SCAN`), adapted | `astral_chain/runtime/posix/w32_memory.c` | MIT |
+
+Carried in the Linux AppImage (not in this repository): [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+CPython 3.14 with Tcl/Tk (PSF License, Tcl/Tk license), Zig 0.17.0 (MIT), glslang 16.6.0 (BSD-3-Clause and others),
+NSTool 1.9.2 (MIT), [SDL3](https://libsdl.org) 3.4 from the Steam Runtime 3 "sniper" SDK (zlib; `tools/linux-sdk/licenses`),
+the Khronos Vulkan loader from the same SDK (Apache-2.0; link input only), Capstone and python-lz4 (BSD-3-Clause).
+

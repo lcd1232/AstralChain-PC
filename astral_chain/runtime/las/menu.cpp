@@ -239,8 +239,8 @@ static const Row controls_rows[] = {
 };
 static const Row advanced_rows[] = {
     {CHECK, "AC_ASYNC_SUBMIT", "Graphics on a separate thread", "Графика в отдельном потоке",
-     "Prepares the graphics on a thread of its own: faster on 4-8 core CPUs.",
-     "Готовит графику в отдельном потоке: быстрее на 4-8-ядерных процессорах.", "0", false},
+     "Prepares the graphics on a thread of its own, while the game goes on with the next frame.",
+     "Готовит графику в отдельном потоке, пока игра готовит следующий кадр.", "1", false},
     {CHECK, "LARECOMP_BC7", "Compress textures on the GPU", "Сжимать текстуры на GPU",
      "BC7: a quarter of the video memory of the textures. Prepared at setup (the launcher's option): no extra "
      "pauses, on by default; else converted on the GPU, with short pauses while areas load.",

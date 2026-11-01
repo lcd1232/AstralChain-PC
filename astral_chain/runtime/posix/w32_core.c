@@ -285,13 +285,9 @@ DWORD MsgWaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL all, DW
 BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD milliseconds, ULONG flags) {
  (void)flags;
  if (milliseconds == INFINITE) { pthread_cond_wait(&cv->cond, &lock->mutex); return TRUE; }
- /* the condition uses the default (realtime) clock: SRW/condition initializers are all-zero, as on Windows */
- struct timespec t;
- clock_gettime(CLOCK_REALTIME, &t);
- t.tv_sec += milliseconds / 1000;
- t.tv_nsec += (long)(milliseconds % 1000) * 1000000L;
- if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
- if (pthread_cond_timedwait(&cv->cond, &lock->mutex, &t) == ETIMEDOUT) { last_error = ERROR_TIMEOUT; return FALSE; }
+ /* on the monotonic clock (glibc 2.30): a wall-clock step (NTP, resume) must not stretch a 20 ms wait */
+ struct timespec t = deadline_after(milliseconds);
+ if (pthread_cond_clockwait(&cv->cond, &lock->mutex, CLOCK_MONOTONIC, &t) == ETIMEDOUT) { last_error = ERROR_TIMEOUT; return FALSE; }
  return TRUE;
 }
 
@@ -453,7 +449,8 @@ DWORD ResumeThread(HANDLE thread) {
   return 1;
  }
  int previous = atomic_load(&object->u.thread.suspend_count);
- if (previous > 0) atomic_fetch_sub(&object->u.thread.suspend_count, 1);
+ if (previous > 0 && atomic_fetch_sub(&object->u.thread.suspend_count, 1) == 1)
+  for (int i = 0; i < 100000 && __atomic_load_n(&object->u.thread.frozen, __ATOMIC_ACQUIRE); i++) sched_yield();
  return (DWORD)previous;
 }
 
@@ -622,9 +619,17 @@ BOOL CreateProcessA(LPCSTR application, LPSTR command_line, LPSECURITY_ATTRIBUTE
   }
  }
  if (directory) posix_spawn_file_actions_addchdir_np(&actions, directory);
+ posix_spawnattr_t attr;
+ posix_spawnattr_init(&attr);
+ sigset_t defaults;
+ sigemptyset(&defaults);
+ sigaddset(&defaults, SIGPIPE);   /* (ignored in this process; the child gets the default action back) */
+ posix_spawnattr_setsigdefault(&attr, &defaults);
+ posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
  pid_t pid;
- int error = strchr(program, '/') ? posix_spawn(&pid, program, &actions, NULL, argv, environ)
-                                  : posix_spawnp(&pid, program, &actions, NULL, argv, environ);
+ int error = strchr(program, '/') ? posix_spawn(&pid, program, &actions, &attr, argv, environ)
+                                  : posix_spawnp(&pid, program, &actions, &attr, argv, environ);
+ posix_spawnattr_destroy(&attr);
  posix_spawn_file_actions_destroy(&actions);
  free(argv[0]); free(argv);
  if (error) { last_error = w32_error_from_errno(error); return FALSE; }
@@ -634,12 +639,12 @@ BOOL CreateProcessA(LPCSTR application, LPSTR command_line, LPSECURITY_ATTRIBUTE
  object->u.process.exit_code = STILL_ACTIVE;
  atomic_store(&object->refs, 2);   /* the handle and the reaper */
  pthread_t t;
- pthread_attr_t attr;
- pthread_attr_init(&attr);
- pthread_attr_setstacksize(&attr, 256 * 1024);
- pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
- pthread_create(&t, &attr, reaper, object);
- pthread_attr_destroy(&attr);
+ pthread_attr_t thread_attr;
+ pthread_attr_init(&thread_attr);
+ pthread_attr_setstacksize(&thread_attr, 256 * 1024);
+ pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
+ pthread_create(&t, &thread_attr, reaper, object);
+ pthread_attr_destroy(&thread_attr);
  information->hProcess = w32_handle_new(object);
  information->hThread = w32_handle_new(thread);
  information->dwProcessId = (DWORD)pid;

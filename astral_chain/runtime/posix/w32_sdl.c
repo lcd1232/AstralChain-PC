@@ -248,7 +248,7 @@ BOOL GetMonitorInfoW(HMONITOR monitor, LPMONITORINFO info) {
 /* ---- messages */
 static MSG queue[512];
 static unsigned queue_head, queue_count;
-static RAWINPUT raw_ring[64];
+static RAWINPUT raw_ring[512];   /* (as many as the message queue holds: WM_INPUT points into it) */
 static unsigned raw_next;
 static float raw_rest_x, raw_rest_y;
 
@@ -341,17 +341,13 @@ static unsigned scan_bits(SDL_Scancode s) {
  }
 }
 
+/* Button and modifier state as of the event being translated (not SDL's current state: a click whose press and release
+ * arrive in one pump would otherwise show no button in its WM_LBUTTONDOWN). */
+static WPARAM mouse_held;
 static WPARAM mouse_keys(void) {
- SDL_MouseButtonFlags b = SDL_GetMouseState(NULL, NULL);
- WPARAM w = 0;
- if (b & SDL_BUTTON_LMASK) w |= MK_LBUTTON;
- if (b & SDL_BUTTON_RMASK) w |= MK_RBUTTON;
- if (b & SDL_BUTTON_MMASK) w |= MK_MBUTTON;
- if (b & SDL_BUTTON_X1MASK) w |= MK_XBUTTON1;
- if (b & SDL_BUTTON_X2MASK) w |= MK_XBUTTON2;
- SDL_Keymod mod = SDL_GetModState();
- if (mod & SDL_KMOD_SHIFT) w |= MK_SHIFT;
- if (mod & SDL_KMOD_CTRL) w |= MK_CONTROL;
+ WPARAM w = mouse_held;
+ if (key_down[VK_SHIFT]) w |= MK_SHIFT;
+ if (key_down[VK_CONTROL]) w |= MK_CONTROL;
  return w;
 }
 
@@ -367,6 +363,7 @@ static void translate(const SDL_Event *e) {
  case SDL_EVENT_WINDOW_FOCUS_LOST: {
   Window *w = window_from_id(e->window.windowID);
   memset(key_down, 0, sizeof key_down);
+  mouse_held = 0;
   post(w, WM_ACTIVATEAPP, 0, 0);
   break;
  }
@@ -402,7 +399,7 @@ static void translate(const SDL_Event *e) {
   Window *w = window_from_id(e->motion.windowID);
   if (!w) break;
   if (relative_on && raw_mouse_on) {
-   RAWINPUT *raw = &raw_ring[raw_next++ % 64];
+   RAWINPUT *raw = &raw_ring[raw_next++ % 512];
    memset(raw, 0, sizeof *raw);
    raw->header.dwType = RIM_TYPEMOUSE;
    raw->header.dwSize = sizeof *raw;
@@ -423,6 +420,10 @@ static void translate(const SDL_Event *e) {
   if (!w) break;
   int down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
   LPARAM at = MAKELONG((int)e->button.x, (int)e->button.y);
+  static const WPARAM bits[6] = {0, MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_XBUTTON1, MK_XBUTTON2};
+  if (e->button.button >= 1 && e->button.button <= 5) {
+   if (down) mouse_held |= bits[e->button.button]; else mouse_held &= ~bits[e->button.button];
+  }
   WPARAM keys = mouse_keys();
   switch (e->button.button) {
   case SDL_BUTTON_LEFT: post(w, down ? WM_LBUTTONDOWN : WM_LBUTTONUP, keys, at); key_down[VK_LBUTTON] = (uint8_t)down; break;
@@ -471,8 +472,8 @@ LRESULT DispatchMessageW(const MSG *message) {
  return w->proc(message->hwnd, message->message, message->wParam, message->lParam);
 }
 LRESULT DefWindowProcW(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
- (void)window; (void)wparam; (void)lparam;
  if (message == WM_CLOSE) DestroyWindow(window);
+ if (message == WM_SYSKEYDOWN && wparam == VK_F4 && (lparam & (1 << 29))) post(window_of(window), WM_CLOSE, 0, 0);   /* Alt+F4 */
  return 0;
 }
 
@@ -701,8 +702,7 @@ typedef struct {
  WAVEFORMATEX format;
  DWORD_PTR callback, instance;
  DWORD flags;
- pthread_mutex_t lock;
- struct { LPWAVEHDR header; uint64_t end; } queue[256];
+ struct { LPWAVEHDR header; uint64_t end; } queue[256];   /* (under the stream's lock, SDL_LockAudioStream) */
  unsigned head, count;
  uint64_t put, position_base;
  /* Played bytes: the device takes whole buffers from the stream ahead of playing them, so what left the stream is
@@ -745,21 +745,21 @@ static uint64_t wave_consumed_locked(WaveDevice *d) {
 static void SDLCALL wave_take(void *user, SDL_AudioStream *stream, int additional, int total) {
  (void)stream; (void)total;
  WaveDevice *d = user;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  uint64_t before = wave_taken_locked(d);
  uint64_t after = before + (uint64_t)additional;
  if (after > d->put) after = d->put;
  wave_consumed_locked(d);   /* (the played position up to now, before the new take moves the anchor) */
  d->taken = after;
  d->taken_at = wave_now();
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
 }
 
 /* Done buffers, oldest first; called with the lock held, notifies after releasing it. */
 static void wave_complete(WaveDevice *d, int all) {
  LPWAVEHDR done[256];
  unsigned n = 0;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  uint64_t consumed = all ? UINT64_MAX : wave_consumed_locked(d);
  while (d->count && d->queue[d->head].end <= consumed) {
   LPWAVEHDR h = d->queue[d->head].header;
@@ -768,7 +768,7 @@ static void wave_complete(WaveDevice *d, int all) {
   d->head = (d->head + 1) % 256;
   d->count--;
  }
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  for (unsigned i = 0; i < n; i++) wave_notify(d, WOM_DONE, done[i]);
 }
 
@@ -801,7 +801,6 @@ MMRESULT waveOutOpen(LPHWAVEOUT out, UINT device, LPCWAVEFORMATEX format, DWORD_
  d->callback = callback;
  d->instance = instance;
  d->flags = flags;
- pthread_mutex_init(&d->lock, NULL);
  /* one device buffer, in this stream's bytes */
  SDL_AudioSpec device_spec;
  int frames = 0;
@@ -820,16 +819,15 @@ MMRESULT waveOutOpen(LPHWAVEOUT out, UINT device, LPCWAVEFORMATEX format, DWORD_
 MMRESULT waveOutClose(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  unsigned pending = d->count;
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  if (pending) return WAVERR_STILLPLAYING;
  d->stop = 1;
  pthread_join(d->poller, NULL);
  SDL_DestroyAudioStream(d->stream);
  wave_notify(d, WOM_CLOSE, NULL);
  d->magic = 0;
- pthread_mutex_destroy(&d->lock);
  free(d);
  return MMSYSERR_NOERROR;
 }
@@ -852,45 +850,45 @@ MMRESULT waveOutWrite(HWAVEOUT out, LPWAVEHDR header, UINT size) {
  if (!d) return MMSYSERR_INVALHANDLE;
  if (!header || size < sizeof(WAVEHDR)) return MMSYSERR_INVALPARAM;
  if (!(header->dwFlags & WHDR_PREPARED)) return WAVERR_UNPREPARED;
- pthread_mutex_lock(&d->lock);
- if (d->count == 256) { pthread_mutex_unlock(&d->lock); return MMSYSERR_NOMEM; }
+ SDL_LockAudioStream(d->stream);
+ if (d->count == 256) { SDL_UnlockAudioStream(d->stream); return MMSYSERR_NOMEM; }
  header->dwFlags = (header->dwFlags & ~WHDR_DONE) | WHDR_INQUEUE;
  if (!SDL_PutAudioStreamData(d->stream, header->lpData, (int)header->dwBufferLength)) {
   header->dwFlags &= ~WHDR_INQUEUE;
-  pthread_mutex_unlock(&d->lock);
+  SDL_UnlockAudioStream(d->stream);
   return MMSYSERR_ERROR;
  }
  d->put += header->dwBufferLength;
  d->queue[(d->head + d->count) % 256].header = header;
  d->queue[(d->head + d->count) % 256].end = d->put;
  d->count++;
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  return MMSYSERR_NOERROR;
 }
 MMRESULT waveOutPause(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  if (!d->paused) { wave_consumed_locked(d); d->paused = 1; d->paused_at = wave_now(); }
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  return SDL_PauseAudioStreamDevice(d->stream) ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
 }
 MMRESULT waveOutRestart(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  if (d->paused) { d->taken_at += wave_now() - d->paused_at; d->paused = 0; }
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  return SDL_ResumeAudioStreamDevice(d->stream) ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
 }
 MMRESULT waveOutReset(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  SDL_ClearAudioStream(d->stream);
  d->taken = d->played = d->position_base = d->put;
  d->taken_at = wave_now();
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  wave_complete(d, 1);
  return MMSYSERR_NOERROR;
 }
@@ -898,10 +896,10 @@ MMRESULT waveOutGetPosition(HWAVEOUT out, LPMMTIME time, UINT size) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
  if (!time || size < sizeof(MMTIME)) return MMSYSERR_INVALPARAM;
- pthread_mutex_lock(&d->lock);
+ SDL_LockAudioStream(d->stream);
  uint64_t consumed = wave_consumed_locked(d);
  uint64_t bytes = consumed > d->position_base ? consumed - d->position_base : 0;
- pthread_mutex_unlock(&d->lock);
+ SDL_UnlockAudioStream(d->stream);
  if (time->wType == TIME_SAMPLES) time->u.sample = (DWORD)(bytes / d->format.nBlockAlign);
  else if (time->wType == TIME_MS) time->u.ms = (DWORD)(bytes * 1000 / d->format.nAvgBytesPerSec);
  else { time->wType = TIME_BYTES; time->u.cb = (DWORD)bytes; }

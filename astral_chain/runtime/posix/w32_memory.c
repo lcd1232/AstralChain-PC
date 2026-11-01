@@ -211,6 +211,9 @@ done:
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old_protect) {
  uint64_t start = (uint64_t)(uintptr_t)address & ~(PG - 1), end = ((uint64_t)(uintptr_t)address + size + PG - 1) & ~(PG - 1);
  pthread_mutex_lock(&vm_lock);
+ if (pstate && end <= PS_LIMIT)
+  for (uint64_t a = start; a < end; a += PG)
+   if (pstate[a / PG] < PS_NONE) { pthread_mutex_unlock(&vm_lock); SetLastError(ERROR_INVALID_ADDRESS); return FALSE; }
  DWORD old = PAGE_READWRITE;
  if (pstate && start < PS_LIMIT) old = protect_of_ps(pstate[start / PG]);
  else { Record *r = record_find(start); if (r) old = r->protect; }
@@ -490,6 +493,8 @@ void w32_thread_signal_setup(void) {
 }
 
 __attribute__((constructor)) static void w32_memory_init(void) {
+ /* a write to a closed pipe fails (ERROR_BROKEN_PIPE / EPIPE) as on Windows instead of ending the process */
+ signal(SIGPIPE, SIG_IGN);
  w32_thread_signal_setup();
  install_faults();
 }

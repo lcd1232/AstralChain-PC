@@ -8,13 +8,14 @@
 int w32_program_main(int argc, char **argv);
 void w32_thread_signal_setup(void);
 
-static int saved_argc, exit_code;
+static int saved_argc, exit_code, returned;
 static char **saved_argv;
 
 static void *run(void *unused) {
  (void)unused;
  w32_thread_signal_setup();
  exit_code = w32_program_main(saved_argc, saved_argv);
+ returned = 1;
  return NULL;
 }
 
@@ -30,6 +31,9 @@ int main(int argc, char **argv) {
  if (pthread_create(&t, &attr, run, NULL)) { perror("main thread"); return 1; }
  pthread_attr_destroy(&attr);
  pthread_join(t, NULL);
+ /* main ended through ExitThread (a guest thread exiting in parallel mode): as on Windows, the process lives on
+  * until its last thread ends */
+ if (!returned) pthread_exit(NULL);
  fflush(stdout);
  fflush(stderr);
  return exit_code;

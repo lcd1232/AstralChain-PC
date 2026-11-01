@@ -61,6 +61,8 @@ static HANDLE create_file(char *path, DWORD access, DWORD share, DWORD dispositi
  }
  if ((oflags & O_TRUNC) && mode == O_RDONLY) mode = O_RDWR;
  if (!existed && (oflags & O_CREAT) && mode == O_RDONLY) mode = O_RDWR;
+ int truncate_after = (oflags & O_TRUNC) && !share;   /* (truncated only once the sharing check passed) */
+ if (truncate_after) oflags &= ~O_TRUNC;
  int fd = open(path, mode | oflags, 0644);
  if (fd < 0) {
   DWORD error = errno == EEXIST ? ERROR_FILE_EXISTS : w32_error_from_errno(errno);
@@ -79,6 +81,11 @@ static HANDLE create_file(char *path, DWORD access, DWORD share, DWORD dispositi
   close(fd);
   free(path);
   SetLastError(ERROR_SHARING_VIOLATION);
+  return INVALID_HANDLE_VALUE;
+ }
+ if (truncate_after && ftruncate(fd, 0)) {
+  DWORD error = w32_error_from_errno(errno);
+  close(fd); free(path); SetLastError(error);
   return INVALID_HANDLE_VALUE;
  }
  W32Object *object = w32_object_new(W32_FILE);

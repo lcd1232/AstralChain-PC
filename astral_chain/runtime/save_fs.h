@@ -140,8 +140,8 @@ static DWORD WINAPI snapshot_thread(void *argument) {
  return 0;
 }
 static void save_snapshot(SaveStore *store) {
- static int on=-1;
- if(on<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_SAVE_SNAPSHOTS",v,sizeof(v));on=!(n && n<sizeof(v) && v[0]=='0');}
+ static int on=1;
+ SETTING_LIVE(on,"AC_SAVE_SNAPSHOTS",1);
  if(!on || !store->ready)return;
  if(InterlockedCompareExchange(&snapshot_busy,1,0))return;  /* one copy at a time */
  wcscpy(snapshot_root,store->root);

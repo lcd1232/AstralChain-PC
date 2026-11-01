@@ -17,6 +17,7 @@
 
 #include "../../settings.h"
 #include "vk.h"
+#include "../../menu.h"
 #include "../renderer.h"
 
 VkG g_vk;
@@ -671,6 +672,10 @@ void backend_present(NvnTexture *t) {
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, uv[0], uv[1], uv[2], uv[3]};
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        // the in-game menu over the picture (menu.cpp; still inside the window image's rendering)
+        MenuTarget mt = {g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam, g_vk.queue, g_vk.sc_format,
+                         g_vk.sc_extent.width, g_vk.sc_extent.height, g_vk.sc_count};
+        if (menu_overlay_frame(&mt)) menu_overlay_draw(vk_cmd());
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;

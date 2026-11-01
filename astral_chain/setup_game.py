@@ -383,9 +383,6 @@ def prepare_bc7():
     Used by the game with LARECOMP_BC7=1; textures not found there are converted on the GPU."""
     if os.environ.get('AC_BC7_PRECOMPUTE') != '1':
         return
-    if host.LINUX:
-        print('  BC7 textures prepared at setup are not available on Linux yet; the game converts them on the GPU.')
-        return
     from . import bc7_cache
     out = GAME_BUILD/'cache'/'bc7'
     stamp = out/'complete.txt'
@@ -409,9 +406,23 @@ def game_data_ready():
     return (UPDATE_EXEFS/'main').is_file() and CONTROL.is_file() and ROMFS_IMAGE.is_file()
 
 
+def bc7_status():
+    """prepared (the BC7 textures are there for this game and encoder), needed (asked for with AC_BC7_PRECOMPUTE=1,
+    not there yet) or off."""
+    stamp = GAME_BUILD/'cache'/'bc7'/'complete.txt'
+    if os.environ.get('AC_BC7_PRECOMPUTE') != '1':
+        return 'prepared' if stamp.is_file() else 'off'
+    from . import bc7_cache
+    want = f'{bc7_cache.tool_digest()} q{bc7_cache.DEFAULT_QUALITY} {ROMFS_IMAGE.stat().st_size}' if ROMFS_IMAGE.is_file() else ''
+    if stamp.is_file() and stamp.read_text(encoding='ascii').strip() == want:
+        return 'prepared'
+    # (no room for it: prepare_bc7 would skip it at every start, so it is not waited for)
+    return 'needed' if shutil.disk_usage(host.HOME).free / 1e9 >= 20 else 'off'
+
+
 def print_status():
-    """For the launcher: installed (the game data is extracted), build (current, stale or missing) and shaders
-    (compiled, needed or never: shader_cache.status)."""
+    """For the launcher: installed (the game data is extracted), build (current, stale or missing), shaders
+    (compiled, needed or never: shader_cache.status) and bc7 (bc7_status)."""
     from . import shader_cache
     built = (GAME_BUILD/'round-00'/'trace.exe').is_file()
     current = built and build_is_current()
@@ -419,7 +430,7 @@ def print_status():
     if shaders == 'compiled' and not current:
         shaders = 'needed'
     print(json.dumps({'installed': game_data_ready(), 'build': 'current' if current else 'stale' if built else 'missing',
-                      'shaders': shaders}))
+                      'shaders': shaders, 'bc7': bc7_status()}))
 
 
 def main():

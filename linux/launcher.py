@@ -27,8 +27,14 @@ import time
 from pathlib import Path
 
 CODE = Path(__file__).resolve().parent.parent
-CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home()/'.config')/'astral-chain-pc'/'config.json'
 APPIMAGE = os.environ.get('APPIMAGE')
+# The AppImage runtime sets HOME to "<AppImage>.home" for its portable mode; started from a desktop's app menu it was
+# found set so without that folder, and Steam was then looked for (and not found) in there. Unless the folder exists
+# (portable mode chosen), the user's own home is used, for this launcher and everything it starts.
+if APPIMAGE and os.environ.get('HOME') == APPIMAGE + '.home' and not os.path.isdir(APPIMAGE + '.home'):
+    import pwd
+    os.environ['HOME'] = pwd.getpwuid(os.getuid()).pw_dir
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home()/'.config')/'astral-chain-pc'/'config.json'
 
 
 def is_steam_deck():
@@ -98,6 +104,9 @@ TEXT = {
     'cancel': ('Cancel', 'Отмена'),
     'close': ('Close', 'Закрыть'),
     'save': ('Save', 'Сохранить'),
+    'in_game_hint': ('Game settings are in the game: F1, or Minus and Plus together on a controller (View and Menu, Back '
+                     'and Start).',
+                     'Настройки игры — в самой игре: F1 или «−» и «+» вместе на контроллере (View и Menu, Back и Start).'),
     'st_none': ('Not installed. Pick your files and the install folder, then press Install.',
                 'Не установлено. Выберите свои файлы и папку установки и нажмите «Установить».'),
     'st_ready': ('Ready to play.', 'Готово к игре.'),
@@ -160,6 +169,11 @@ OPTIONS = [
      'check', '0', '1', lambda v: {'AC_ASYNC_SUBMIT': '1'} if v == '1' else {}),
     ('gpu_warm', 'group_performance', ('Compile shaders for this GPU before playing', 'Компилировать шейдеры под эту видеокарту до игры'),
      'check', '1', '1', lambda v: {} if v == '1' else {'AC_GPU_WARM': '0'}),
+    ('bc7_prepare', 'group_performance', ('Prepare BC7 textures at setup: a quarter of the video memory, no extra pauses '
+                                          '(once: about 16 GB of disk and 15-30 minutes)',
+                                          'Подготовить текстуры BC7 при установке: вчетверо меньше видеопамяти, без лишних '
+                                          'пауз (один раз: около 16 ГБ на диске и 15-30 минут)'),
+     'check', '1', '1', lambda v: {'AC_BC7_PRECOMPUTE': '1'} if v == '1' else {}),
     ('bc7', 'group_performance', ('Compress textures on the GPU (BC7: less memory traffic; short pauses while areas load)', 'Сжимать текстуры на GPU (BC7: меньше нагрузка на память; короткие паузы при загрузке зон)'),
      'check', '0', '1', lambda v: {'LARECOMP_BC7': '1'} if v == '1' else {}),
     ('game_language', 'group_game', ('Game language (text and subtitles; the game is rebuilt once, about a minute)',
@@ -178,8 +192,9 @@ OPTIONS = [
      'check', '1', '1', lambda v: {} if v == '1' else {'AC_MOUSE_LOOK': '0'}),
     ('mouse_invert', 'group_mouse', ('Invert mouse up and down', 'Инвертировать мышь по вертикали'),
      'check', '0', '0', lambda v: {'AC_MOUSE_INVERT': '1'} if v == '1' else {}),
-    ('prompts', 'group_mouse', ('Button icons', 'Значки кнопок'), ('switch', 'keyboard'), 'keyboard', 'switch',
-     lambda v: {'AC_PROMPTS': 'switch'} if v == 'switch' else {}),
+    ('prompts', 'group_mouse', ('Button icons', 'Значки кнопок'),
+     (('keyboard', 'Keyboard / mouse'), ('xbox', 'Xbox / Steam'), ('ps', 'PlayStation'), ('switch', 'Switch')),
+     'keyboard', 'xbox', lambda v: {'AC_PROMPTS': v} if v in ('xbox', 'ps', 'switch') else {}),
     ('gpu_astc', 'group_trouble', ('Decode ASTC textures on the GPU', 'Декодировать ASTC-текстуры на GPU'),
      'check', '1', '1', lambda v: {} if v == '1' else {'LARECOMP_GPU_ASTC': '0'}),
     ('gpl', 'group_trouble', ('Shader libraries (fast pipeline linking)', 'Библиотеки шейдеров (быстрая сборка конвейеров)'),
@@ -187,7 +202,14 @@ OPTIONS = [
     ('pipe_warm', 'group_trouble', ('Build recorded pipelines ahead of their first draw', 'Заранее собирать записанные конвейеры'),
      'check', '1', '1', lambda v: {} if v == '1' else {'LARECOMP_NO_PIPE_WARM': '1'}),
 ]
-SETUP_KEYS = ('gpu_warm', 'gpl', 'game_language')   # these change what the setup builds or compiles
+# The game's own settings are in its in-game menu now (F1, or Minus and Plus on a controller: astral_chain/runtime/las/
+# menu.cpp), kept in settings.ini in the install folder (AC_SETTINGS_FILE). What the launcher had for them goes there
+# once, when there is no settings.ini yet (game_env); the launcher shows only its own and the setup's settings.
+IN_GAME = ('fullscreen', 'handheld', 'present', 'fps_limit', 'async_submit', 'bc7', 'cutscene_fps_30', 'ignore_focus',
+           'save_snapshots', 'audio_resync', 'mouse_look', 'mouse_invert', 'prompts', 'gpu_astc', 'pipe_warm')
+GAME_OPTIONS = [o for o in OPTIONS if o[0] in IN_GAME]
+OPTIONS = [o for o in OPTIONS if o[0] not in IN_GAME]
+SETUP_KEYS = ('gpu_warm', 'gpl', 'game_language', 'bc7_prepare')   # these change what the setup builds or compiles
 
 
 def default_install():
@@ -201,7 +223,7 @@ def load_config():
         config = {}
     config.setdefault('install', default_install())
     settings = config.setdefault('settings', {})
-    for key, _, _, _, default, deck_default, _ in OPTIONS:
+    for key, _, _, _, default, deck_default, _ in OPTIONS + GAME_OPTIONS:
         settings.setdefault(key, deck_default if DECK else default)
     return config
 
@@ -213,9 +235,9 @@ def save_config(config):
     os.replace(tmp, CONFIG)
 
 
-def option_env(config, keys=None):
+def option_env(config, keys=None, options=None):
     env = {}
-    for key, _, _, _, _, _, make in OPTIONS:
+    for key, _, _, _, _, _, make in options or OPTIONS + GAME_OPTIONS:
         if keys is None or key in keys:
             env.update(make(config['settings'].get(key, '')))
     return env
@@ -265,12 +287,29 @@ def game_env(config):
             if '=' in line:
                 name, value = line.split('=', 1)
                 env[name.strip()] = value.strip()
-    env.update(option_env(config))
+    env.update(option_env(config, options=OPTIONS))
+    env['AC_SETTINGS_FILE'] = str(game_settings_file(config))
     if not env.get('AC_FONT') and (font := system_font()):
         env['AC_FONT'] = font
     if not env.get('AC_PROMPT_FONT') and (font := system_font(':bold')):
         env['AC_PROMPT_FONT'] = font
     return env
+
+
+def game_settings_file(config):
+    """settings.ini of the in-game menu; the first time, made from what the launcher had for those settings (the Steam
+    Deck's defaults included)."""
+    path = Path(config['install']).expanduser()/'settings.ini'
+    if not path.exists():
+        env = option_env(config, IN_GAME, GAME_OPTIONS)
+        lines = ['# Astral Chain PC settings: written by the in-game menu (F1, or Minus and Plus together)']
+        lines += [f'{name}={value}' for name, value in sorted(env.items())]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        except OSError:
+            pass
+    return path
 
 
 def system_font(style=''):
@@ -293,9 +332,7 @@ def run_game(config, log=print):
     round0 = run/'round-00'
     exe = round0/'trace.exe'
     env = game_env(config)
-    for name in ('AC_FULLSCREEN', 'AC_HANDHELD', 'AC_FPS_LIMIT', 'AC_ASYNC_SUBMIT', 'LARECOMP_VK_PRESENT'):
-        if name in env:
-            log(f'{name}={env[name]}')
+    log(t('in_game_hint'))
     with open(round0/'trace.log', 'w', encoding='utf-8', errors='replace') as out, \
             open(round0/'stderr.log', 'w', encoding='utf-8', errors='replace') as err:
         process = subprocess.Popen([str(exe), str(round0/'relocations.bin')], cwd=run, env=env, stdout=out, stderr=err)
@@ -322,13 +359,25 @@ def steam_running():
     return False
 
 
+def steam_roots():
+    """Where Steam keeps its data: XDG_DATA_HOME/Steam, ~/.local/share/Steam, and what ~/.steam/root points to."""
+    roots = []
+    for path in (Path(os.environ.get('XDG_DATA_HOME') or Path.home()/'.local/share')/'Steam', Path.home()/'.local/share/Steam',
+                 Path.home()/'.steam'/'root', Path.home()/'.steam'/'steam'):
+        if path.is_dir() and path.resolve() not in roots:
+            roots.append(path.resolve())
+    return roots
+
+
 def add_to_steam():
     """A non-Steam shortcut to this AppImage (or launcher) with --play; artwork from launcher/art. Steam must be closed
     (it rewrites shortcuts.vdf on exit). Returns the number of Steam users updated."""
     import struct
     import zlib
-    steam = Path.home()/'.local/share/Steam'
-    users = [p for p in (steam/'userdata').glob('*') if p.is_dir() and p.name.isdigit() and p.name != '0']
+    users = []
+    for steam in steam_roots():
+        users += [p for p in (steam/'userdata').glob('*') if p.is_dir() and p.name.isdigit() and p.name != '0'
+                  and p.resolve() not in [u.resolve() for u in users]]
     if not users:
         return 0
     exe = f'"{APPIMAGE}"' if APPIMAGE else f'"{sys.executable}"'
@@ -609,7 +658,7 @@ class App:
         self.remember()
         state = getattr(self, 'state', {})
         self.set_busy(True, t('st_busy'))
-        if state.get('build') != 'current' or state.get('shaders') != 'compiled':
+        if state.get('build') != 'current' or state.get('shaders') != 'compiled' or state.get('bc7') == 'needed':
             # a newer launcher (rebuild once) or shaders not prepared yet: the setup does what is missing, then play
             self.stream(setup_command('--rebuild-if-stale'), base_env(self.config), self.start_game)
         else:
@@ -703,6 +752,8 @@ class App:
                 ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w')
                 ttk.Combobox(frame, textvariable=var, values=list(kind), state='readonly', width=12).grid(row=row, column=1, sticky='w', padx=8)
             row += 1
+        ttk.Label(frame, text=t('in_game_hint'), wraplength=520, justify='left').grid(row=row, column=0, columnspan=2, sticky='w', pady=(14, 0))
+        row += 1
 
         def save():
             ui_before = self.config['settings'].get('ui_language')
@@ -788,9 +839,12 @@ def main():
                                 cwd=CODE, env=base_env(config)).returncode)
     if args.play:
         state = status(config)
-        if state.get('installed') and state.get('build') == 'current':
+        # (BC7 textures still to prepare: the window, which shows the long step's progress)
+        if state.get('installed') and state.get('build') == 'current' and state.get('bc7') != 'needed':
             code = run_game(config)
-            subprocess.run(setup_command('--rebuild-if-stale'), cwd=CODE, env=base_env(config),
+            env = base_env(config)
+            env.pop('AC_BC7_PRECOMPUTE', None)   # (not a silent half hour after the game)
+            subprocess.run(setup_command('--rebuild-if-stale'), cwd=CODE, env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sys.exit(code)
     use_xft_tk()

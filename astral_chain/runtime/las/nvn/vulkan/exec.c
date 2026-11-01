@@ -3120,18 +3120,18 @@ static void gmem_writeback_apply(uint64_t done) {
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
     // Astral Chain: on a discrete GPU the device-local mirror. The host-pointer import made the NVIDIA driver log
-    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). On an integrated GPU the
-    // heap is imported (as the TotK port does): the GPU reads the same system memory, and the mirror was a second copy
-    // of it (2.8 GB on an Intel Arc B390) with the written pages copied in before each submission. A failed import
-    // falls back to the mirror. AC_VK_HEAP_IMPORT=1 / 0 forces either. The heap's write tracking stops once it is
-    // imported (nvn_hle.h written_pages): on Linux each tracking query protects the written pages again, and on an
-    // imported (pinned) range each change made the driver (Mesa ANV on Xe) pin the pages again - the render thread
-    // spent most of its time in the kernel and an Arc B390 fell from 60 to 8-17 fps (2026-11-01).
+    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). AC_VK_HEAP_IMPORT=1 imports
+    // the heap instead (as the TotK port does): on an integrated GPU the mirror is a second copy of the same system
+    // memory (2.8 GB). Once imported, the heap's write tracking stops (nvn_hle.h written_pages): on Linux each tracking
+    // query protects the written pages again, and on an imported (pinned) range the driver (Mesa ANV on Xe) pinned them
+    // again - most of the render thread's time in the kernel, 8-17 fps on an Arc B390. Without tracking, the texture
+    // checks hash contents and the vertices are read in place: in a busy scene on that Arc B390 (~1000 draws a frame)
+    // 30-35 fps against 48-57 with the mirror (2026-11-02), so the mirror stays the default. A failed import falls back
+    // to the mirror.
     static int import = -1;
     if (import < 0) {
         const char *e = getenv("AC_VK_HEAP_IMPORT");
-        bool by_default = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-        import = g_vk.host_import && (e ? atoi(e) != 0 : by_default);
+        import = g_vk.host_import && e && atoi(e) != 0;
         LOG("[vk] guest heap for shader global memory: %s\n", import ? "imported (no copy)" : "mirrored in device memory");
     }
     if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL;

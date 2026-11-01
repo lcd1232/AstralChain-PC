@@ -154,8 +154,10 @@ static void *aq_worker(void *arg) {
 }
 static bool aq_enabled(void) {
     if (aq_on < 0) {
+        // (on unless AC_ASYNC_SUBMIT=0: in a busy scene on an Intel Arc B390 laptop, ~900 draws a frame, 30-40 fps
+        //  without the worker and 56-61 with it, 2026-11-02; the render thread spent ~30% of its time translating)
         const char *e = getenv("AC_ASYNC_SUBMIT");
-        aq_on = e && atoi(e) != 0;
+        aq_on = !e || atoi(e) != 0;
         if (aq_on) {
             pthread_t t;
             if (pthread_create(&t, NULL, aq_worker, NULL)) { LOG("[nvn] async submission: no worker thread\n"); aq_on = 0; }

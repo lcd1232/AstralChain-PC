@@ -705,9 +705,18 @@ typedef struct {
  struct { LPWAVEHDR header; uint64_t end; } queue[256];
  unsigned head, count;
  uint64_t put, position_base;
+ /* Played bytes: the device takes whole buffers from the stream ahead of playing them, so what left the stream is
+  * not what was heard. At each take (the stream's get callback) the bytes taken so far and the time are recorded;
+  * the played position is that count minus one device buffer, advanced by the clock since, never past what was
+  * taken and never backwards. waveOut's position and its buffer completions follow it. */
+ uint64_t taken, played, lag;
+ double taken_at, paused_at;
+ int paused;
  pthread_t poller;
  volatile int stop;
 } WaveDevice;
+
+static double wave_now(void) { return (double)SDL_GetTicksNS() / 1e9; }
 
 static void wave_notify(WaveDevice *d, UINT message, LPWAVEHDR header) {
  DWORD type = d->flags & 0x70000u;
@@ -716,9 +725,34 @@ static void wave_notify(WaveDevice *d, UINT message, LPWAVEHDR header) {
  else if (type == CALLBACK_EVENT && d->callback) SetEvent((HANDLE)d->callback);
 }
 
-static uint64_t wave_consumed_locked(WaveDevice *d) {
+static uint64_t wave_taken_locked(WaveDevice *d) {
  int queued = SDL_GetAudioStreamQueued(d->stream);
  return queued >= 0 && (uint64_t)queued <= d->put ? d->put - (uint64_t)queued : d->put;
+}
+
+static uint64_t wave_consumed_locked(WaveDevice *d) {
+ uint64_t taken = wave_taken_locked(d);
+ if (taken > d->taken) { d->taken = taken; d->taken_at = wave_now(); }   /* (a take the callback did not see) */
+ double now = d->paused ? d->paused_at : wave_now();
+ double since = now > d->taken_at ? now - d->taken_at : 0;
+ uint64_t estimate = d->taken > d->lag ? d->taken - d->lag : 0;
+ estimate += (uint64_t)(since * d->format.nAvgBytesPerSec) / d->format.nBlockAlign * d->format.nBlockAlign;
+ if (estimate > d->taken) estimate = d->taken;
+ if (estimate > d->played) d->played = estimate;
+ return d->played;
+}
+
+static void SDLCALL wave_take(void *user, SDL_AudioStream *stream, int additional, int total) {
+ (void)stream; (void)total;
+ WaveDevice *d = user;
+ pthread_mutex_lock(&d->lock);
+ uint64_t before = wave_taken_locked(d);
+ uint64_t after = before + (uint64_t)additional;
+ if (after > d->put) after = d->put;
+ wave_consumed_locked(d);   /* (the played position up to now, before the new take moves the anchor) */
+ d->taken = after;
+ d->taken_at = wave_now();
+ pthread_mutex_unlock(&d->lock);
 }
 
 /* Done buffers, oldest first; called with the lock held, notifies after releasing it. */
@@ -768,6 +802,14 @@ MMRESULT waveOutOpen(LPHWAVEOUT out, UINT device, LPCWAVEFORMATEX format, DWORD_
  d->instance = instance;
  d->flags = flags;
  pthread_mutex_init(&d->lock, NULL);
+ /* one device buffer, in this stream's bytes */
+ SDL_AudioSpec device_spec;
+ int frames = 0;
+ if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &device_spec, &frames) || frames <= 0) frames = 1024;
+ double scale = device_spec.freq > 0 ? (double)format->nSamplesPerSec / device_spec.freq : 1.0;
+ d->lag = (uint64_t)(frames * scale) * format->nBlockAlign;
+ d->taken_at = wave_now();
+ SDL_SetAudioStreamGetCallback(stream, wave_take, d);
  pthread_create(&d->poller, NULL, wave_poll, d);
  SDL_ResumeAudioStreamDevice(stream);   /* an opened waveOut device plays (until paused) */
  *out = (HWAVEOUT)d;
@@ -828,11 +870,17 @@ MMRESULT waveOutWrite(HWAVEOUT out, LPWAVEHDR header, UINT size) {
 MMRESULT waveOutPause(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
+ pthread_mutex_lock(&d->lock);
+ if (!d->paused) { wave_consumed_locked(d); d->paused = 1; d->paused_at = wave_now(); }
+ pthread_mutex_unlock(&d->lock);
  return SDL_PauseAudioStreamDevice(d->stream) ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
 }
 MMRESULT waveOutRestart(HWAVEOUT out) {
  WaveDevice *d = wave_of(out);
  if (!d) return MMSYSERR_INVALHANDLE;
+ pthread_mutex_lock(&d->lock);
+ if (d->paused) { d->taken_at += wave_now() - d->paused_at; d->paused = 0; }
+ pthread_mutex_unlock(&d->lock);
  return SDL_ResumeAudioStreamDevice(d->stream) ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
 }
 MMRESULT waveOutReset(HWAVEOUT out) {
@@ -840,7 +888,8 @@ MMRESULT waveOutReset(HWAVEOUT out) {
  if (!d) return MMSYSERR_INVALHANDLE;
  pthread_mutex_lock(&d->lock);
  SDL_ClearAudioStream(d->stream);
- d->position_base = d->put;
+ d->taken = d->played = d->position_base = d->put;
+ d->taken_at = wave_now();
  pthread_mutex_unlock(&d->lock);
  wave_complete(d, 1);
  return MMSYSERR_NOERROR;

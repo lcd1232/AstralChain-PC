@@ -446,6 +446,7 @@ void *nvn_host_window(void) {
  * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1).
  * AC_FPS_LIMIT=<20..60> paces on a grid of that rate instead of 60 Hz (a steady 40 fps on handhelds such as the
  * Steam Deck; the game's step follows the measured frame time, so it runs at the right speed). */
+unsigned nvn_present_count;  /* (presents so far: svc #0xB3 marks the last one a movie played in) */
 void nvn_present_pace(int interval) {
  static int override=-2;
  static uint64_t period=320000; /* 19.2 MHz / 60 Hz */
@@ -467,7 +468,15 @@ void nvn_present_pace(int interval) {
  if(override>=0) interval=override;
  /* AC_CUTSCENE_FPS=30: cutscenes at 30 FPS, as in the unmodified game (svc #0xB1 in host_runtime.c.in). */
  extern int cutscene_mode;
- if(cutscene_mode && interval>0 && interval<2 && period==320000) interval=2;
+ extern unsigned movie_present_mark;
+ /* Movies (svc #0xB3, movie-sync-1.0.1.pchtxt): at 30 FPS while one played in the last 4 presents, as on the Switch.
+  * AC_MOVIE_FPS=60: as fast as the rest. */
+ static int movie_fps=30;
+ SETTING_LIVE(movie_fps,"AC_MOVIE_FPS",30);
+ int movie=movie_fps!=60 && nvn_present_count-movie_present_mark<4u;
+ {static int was;if(movie!=was) {printf("NVN movie %s\n",movie ? "playing: 30 FPS" : "ended");was=movie;}}
+ nvn_present_count++;
+ if((cutscene_mode || movie) && interval>0 && interval<2 && period==320000) interval=2;
  if(interval<=0) return;
  uint64_t now=rt_ticks();
  if(!origin) {origin=now;last_vsync=0;return;}

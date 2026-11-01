@@ -168,7 +168,14 @@ static bool aq_enabled(void) {
 }
 static uint64_t aq_push(AsyncJob j) {  // the job's number (done when aq_head reaches it)
     pthread_mutex_lock(&aq_lock);
-    while (aq_tail - aq_head == AQ_SIZE || (j.kind == AJ_PRESENT && aq_presents >= 1)) pthread_cond_wait(&aq_less, &aq_lock);
+    // A present waits until the worker has run everything queued before it (AC_ASYNC_PRESENT_DRAIN=0: only the
+    // previous present). With two frames in flight the worker read guest memory the game had already rewritten for the
+    // next frame more often: the title screen's background movie showed frames with black or shifted parts, 4-8 in
+    // 12 s recorded at 60 fps, 0-2 with the drain, 0-2 without the worker either (2026-11-02: that one is older).
+    static int drain = -1;
+    if (drain < 0) { const char *e = getenv("AC_ASYNC_PRESENT_DRAIN"); drain = !e || atoi(e) != 0; }
+    while (aq_tail - aq_head == AQ_SIZE || (j.kind == AJ_PRESENT && (aq_presents >= 1 || (drain && aq_tail != aq_head))))
+        pthread_cond_wait(&aq_less, &aq_lock);
     aq[aq_tail % AQ_SIZE] = j;
     uint64_t id = ++aq_tail;
     if (j.kind == AJ_PRESENT) aq_presents++;

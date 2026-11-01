@@ -7,15 +7,19 @@
 // time [+0x644] was cleared and taken again from the frame then due, so the sound, which plays on by itself, stayed
 // ahead by the whole delay for the rest of the movie. One stall over 132 ms (a slow first frame, an area loading)
 // left 0.65-1.4 s between the voices and the lips in the opening cutscene, different at each start (measured
-// against two Switch recordings). Here the late picture keeps its clock: it is "due" until it has caught up, so the
-// player decodes the next frames back to back and the picture rejoins its sound.
+// against two Switch recordings). Here a late picture keeps its clock while it is
+// less than 2 s behind: it is "due" until it has caught up, so the player decodes the next frames back to back and the
+// picture rejoins its sound. Further behind, the player starts its clock again as before: the title screen's
+// background movie starts its clock while the game is still loading, and catching that up held the title's "ZL + ZR"
+// prompt back (19 s after the title appeared against ~4 s on a Switch, 2026-11-02).
 //
-// 0x7004E8 (run time 0x70007104E8; this file's offsets + 0x7000010000 are run-time addresses, as for the svc #0xB1
-// of cutscene-catchup-1.0.1.pchtxt at 0x7000A1EFD4): b.le 0x700071040C (the frame is due; past twice the threshold:
-// fall through and clear the start time) -> b 0x700071040C.
+// 0x7004E0 (run time 0x70007104E0; this file's offsets + 0x7000010000 are run-time addresses, as for the svc #0xB1
+// of cutscene-catchup-1.0.1.pchtxt at 0x7000A1EFD4): ldr w8, [x19, #0x64c] (the threshold, compared doubled with how
+// late the frame is) -> mov w8, #1000: a frame up to 2 s late is due (b.le 0x700071040C), a later one clears the
+// start time.
 
 @flag offset_shift 0x100
 
 @enabled
-007004E8 C9FFFF17 // b 0x700071040C: a late frame is due (was b.le, else clear the start time)
+007004E0 087D8052 // mov w8, #1000 (was ldr w8, [x19, #0x64c]): catch up to 2 s, else start the clock again
 @stop

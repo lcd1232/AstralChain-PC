@@ -18,8 +18,16 @@
 // late the frame is) -> mov w8, #1000: a frame up to 2 s late is due (b.le 0x700071040C), a later one clears the
 // start time.
 
+//
+// Movies at 30 FPS: the player's frame clock (0x70007103E0) runs every frame while a movie plays; its "mov x19, x0"
+// at 0x70007103EC becomes svc #0xB3, which the runtime runs (host_runtime.c.in) and takes as "a movie is playing":
+// the frames are presented at 30 FPS meanwhile (nvn_hle.h nvn_present_pace), as on the Switch. At 60 FPS the title
+// screen's background movie showed, every few frames, an old picture of the whole screen for one refresh (10-16 in
+// 12 s recorded at 60 FPS; none at 30 FPS; 2026-11-02). AC_MOVIE_FPS=60: as fast as the rest.
+
 @flag offset_shift 0x100
 
 @enabled
+007003EC 611600D4 // svc #0xB3 (was mov x19, x0): a movie plays this frame
 007004E0 087D8052 // mov w8, #1000 (was ldr w8, [x19, #0x64c]): catch up to 2 s, else start the clock again
 @stop

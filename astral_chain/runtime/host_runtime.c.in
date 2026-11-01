@@ -462,7 +462,11 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc);
 static unsigned test_stall_ms;  /* (AC_CUTSCENE_STALL) slept after the kernel lock is released */
 /* Parallel mode: supervisor calls run under the kernel lock; any state change may wake other guest threads; a call
  * that leaves this thread waiting blocks its host thread (lock released while asleep); an exited thread ends. */
+/* svc #0xB3 (movie-sync-1.0.1.pchtxt): a movie's frame clock ran this frame (the replaced mov x19, x0 is done here);
+ * nvn_present_pace presents at 30 FPS while that happens. No kernel state: no lock. */
+unsigned movie_present_mark;
 void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
+ if(imm==0xB3) {extern unsigned nvn_present_count;c->x[19]=c->x[0];movie_present_mark=nvn_present_count;return;}
  if(!parallel_mode) {rt_svc_body(c,imm,pc);return;}
  if(imm==0xb) {
   /* SleepThread / yield: nothing else can end it early, so no kernel state is involved (the most frequent call:

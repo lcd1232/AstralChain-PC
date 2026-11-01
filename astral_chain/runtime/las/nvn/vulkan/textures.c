@@ -663,6 +663,15 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint64_t total = tegra_total_size(&t->layout);
     b->checked_frame = frame;
     prof_tex_checks++;
+    {   // a full-screen movie's luma plane (R8, 16:9, 1280 wide or more, rewritten by the CPU): nvn_present_pace runs
+        // movies at 30 FPS only while one of those arrives, not for the small movies on screens in the game's world
+        extern unsigned nvn_present_count, movie_plane_mark;
+        if (t->format == 0x1 && t->width >= 1280 && t->width * 9 == t->height * 16 && (b->dynamic || (t->flags & 0x10))) {
+            static uint32_t logged;
+            if (logged != t->width) { logged = t->width; LOG("[vk] full-screen movie plane %ux%u\n", t->width, t->height); }
+            movie_plane_mark = nvn_present_count;
+        }
+    }
     if (t->flags & 0x10) b->dynamic = true;
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;

@@ -177,8 +177,11 @@ static bool bc7_format_ok(VkFormat f) {
 bool vk_bc7_ready(void) {
     if (state) return state == 1;
     state = 2;
+    // (not set: on when the BC7 textures were prepared at setup, cache/bc7 of the run folder)
     const char *e = getenv("LARECOMP_BC7");
-    if (!e || !atoi(e)) return false;
+    FILE *prepared = e ? NULL : fopen("cache/bc7/complete.txt", "rb");
+    if (prepared) fclose(prepared);
+    if (e ? !atoi(e) : !prepared) return false;
     if (!vk_astc_gpu_ready()) { LOG("[vk] BC7: needs the GPU ASTC decoder, off\n"); return false; }
     if (!bc7_format_ok(VK_FORMAT_BC7_UNORM_BLOCK) || !bc7_format_ok(VK_FORMAT_BC7_SRGB_BLOCK)) {
         LOG("[vk] BC7: not supported by this GPU, off\n");

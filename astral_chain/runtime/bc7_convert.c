@@ -1,7 +1,7 @@
 // BC7 precomputation for the optional setup step (astral_chain/bc7_cache.py): one game texture (its XT1 header
 // fields and data, as stored in the game's WTP files and loaded as is into texture memory) -> BC7 blocks of every
 // layer and level, in bc7_cache.h's order, encoded on the CPU with bc7enc (third_party/bc7enc: modes 1, 5, 6 and 7).
-// Built as a DLL; Python calls it from several threads at once (every call is independent).
+// Built as a DLL (a shared library on Linux); Python calls it from several threads at once (every call is independent).
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +11,11 @@
 #include "las/nvn/vulkan/bc7_cache.h"
 #include "bc7enc.h"
 
+#ifdef _WIN32
 #define EXPORT __declspec(dllexport)
+#else
+#define EXPORT __attribute__((visibility("default")))
+#endif
 
 EXPORT void bc7c_init(void) { bc7enc_compress_block_init(); }
 

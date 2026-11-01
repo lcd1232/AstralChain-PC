@@ -108,8 +108,8 @@ static MMRESULT wave_output_append(WaveOutput *output,uint64_t tag,const void *p
   * the game's own pauses (loading). */
  size_t skip=0;double dump_gap=0;
  if(output->running) {
-  static int resync=-1;
-  if(resync<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_AUDIO_RESYNC",v,sizeof(v));resync=!(n && n<sizeof(v) && v[0]=='0');}
+  static int resync=1;
+  SETTING_LIVE(resync,"AC_AUDIO_RESYNC",1);
   LARGE_INTEGER f,q;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&q);
   double now=(double)q.QuadPart/(double)f.QuadPart;
   uint64_t played;  /* re-anchored on the device's position: the estimate alone drifts with the device clock */

@@ -192,6 +192,15 @@ static uint64_t hid_script_buttons(uint64_t now) {
  if(mask!=last) {printf("HID script t=%.2f buttons=0x%llx\n",t,(unsigned long long)mask);last=mask;}
  return mask|hid_file_buttons(now);
 }
+/* The in-game menu (las/menu.h): weak, a build without the Vulkan layer has none. */
+int menu_is_open(void) __attribute__((weak));
+void menu_toggle(void) __attribute__((weak));
+void menu_key(unsigned vk,int down) __attribute__((weak));
+void menu_mouse_move(float x,float y,float client_w,float client_h) __attribute__((weak));
+void menu_mouse_button(int button,int down) __attribute__((weak));
+void menu_mouse_wheel(float steps) __attribute__((weak));
+int menu_pad_gate(uint64_t buttons,int32_t lx,int32_t ly) __attribute__((weak));
+static int menu_open(void) {return menu_is_open && menu_is_open();}
 static void hid_publish(uint64_t now,int focused) {
  if(!hid_page || !hid_active) return;
  unsigned connected=(hid_styles&1) && (hid_ids&1);
@@ -231,6 +240,8 @@ static void hid_publish(uint64_t now,int focused) {
   if(scripted&(1ull<<18)) sample.lx=32767;
   if(scripted&(1ull<<17)) sample.ly=32767;
   if(scripted&(1ull<<19)) sample.ly=-32767;
+  /* (Minus and Plus together open the menu; while it is open, and until what was held is let go, no game input) */
+  if(menu_pad_gate && menu_pad_gate(sample.buttons,sample.lx,sample.ly)) {sample.buttons=0;sample.lx=sample.ly=sample.rx=sample.ry=0;}
  }
  hid_ring_write((HidRing*)(npad+0x28),&sample);
  hid_ring_write((HidRing*)(npad+0x1408),&sample);

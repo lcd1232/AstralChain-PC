@@ -1,10 +1,14 @@
-/* Keyboard and mouse button prompts. The game draws every button prompt (in text, on the HUD, in menus) from one
+/* Keyboard and mouse, or Xbox / PlayStation controller, button prompts. The game draws every button prompt (in text, on the HUD, in menus) from one
  * 256x512 RGBA8 atlas in ui_core (core.wtp, texture 0): white shapes on transparency with the letter cut out, tinted by
  * the game. When that texture is uploaded, each Switch button icon is replaced by the key or mouse button it is bound
  * to (las/input_bindings.h, the launcher's Controls), drawn in the same style inside the same footprint.
  *
  * Hooks of textures.c (texpatch.h): texpatch_identify finds the atlas by its contents, texpatch_apply repaints its
- * level 0 before upload. AC_PROMPTS=switch keeps the original icons. */
+ * level 0 before upload. AC_PROMPTS=switch keeps the original icons; AC_PROMPTS=xbox or ps redraws only the face
+ * buttons, shoulders, triggers and +/- with that controller's labels, by position (as hid_service.h maps XInput: the
+ * Switch's right button A is Xbox B / PS circle, its bottom B is Xbox A / PS cross, and so on), and keeps the stick,
+ * stick press, D-pad and face button diagram icons, which are the same on every controller. AC_PROMPTS_DUMP=<dir>
+ * writes the atlas before and after (atlas-before.rgba, atlas-after.rgba: 256x512 RGBA8) for checking the drawing. */
 #include <windows.h>
 #include <math.h>
 #include <stdbool.h>
@@ -18,6 +22,7 @@
 #include "nvn/vulkan/bc7_cache.h"
 #include "input_bindings.h"
 #include "texpatch.h"
+#include "ps5_glyphs.h"
 
 #define ATLAS_HASH 0x4afe0dd389f44dc9ull
 #define ATLAS_W 256
@@ -47,16 +52,30 @@ static const Slot slots[] = {
 
 static uint8_t map[2][IB_ACTIONS];
 static int mouse_look = 1;
+enum { STYLE_KEYBOARD, STYLE_XBOX, STYLE_PS };
+static int style = STYLE_KEYBOARD;
+
+/* AC_PROMPTS and AC_MOUSE_LOOK, read again when the in-game menu changes a setting (game_settings.h in the host runtime);
+ * a change of look bumps the generation, and textures.c uploads the atlas again. */
+int setting_get(const char *name, char *buf, unsigned size);
+int setting_int(const char *name, int otherwise);
+unsigned settings_version(void);
+static int on = 1;
+static uint32_t generation = 1;
 
 static int enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("AC_PROMPTS");
-        on = !(e && (!strcmp(e, "switch") || !strcmp(e, "0")));
-        ib_load(map);
-        e = getenv("AC_MOUSE_LOOK");
-        mouse_look = !(e && *e == '0');
-    }
+    static unsigned version = ~0u;
+    static int loaded;
+    if (!loaded) { loaded = 1; ib_load(map); }
+    if (version == settings_version()) return on;
+    version = settings_version();
+    char e[32];
+    if (!setting_get("AC_PROMPTS", e, sizeof e)) e[0] = 0;
+    int was_on = on, was_style = style, was_look = mouse_look;
+    on = strcmp(e, "switch") && strcmp(e, "0");
+    style = !strcmp(e, "xbox") ? STYLE_XBOX : !strcmp(e, "ps") || !strcmp(e, "playstation") ? STYLE_PS : STYLE_KEYBOARD;
+    mouse_look = setting_int("AC_MOUSE_LOOK", 1) != 0;
+    if (on != was_on || style != was_style || mouse_look != was_look) generation++;
     return on;
 }
 
@@ -97,6 +116,19 @@ static void fill_arrow(Canvas *cv, float cx, float cy, float s, int d, uint8_t v
             if (d == D_UP) { a = u; b = w; } else if (d == D_DOWN) { a = u; b = -w; }
             else if (d == D_LEFT) { a = w; b = u; } else { a = w; b = -u; }
             if (b >= -0.8f && b <= 0.6f && fabsf(a) <= (b + 0.8f) * 0.75f) cv->c[y * cv->w + x] = v;
+        }
+}
+
+/* A thick line from (ax, ay) to (bx, by) with round ends. */
+static void fill_line(Canvas *cv, float ax, float ay, float bx, float by, float t, uint8_t v) {
+    float r = t / 2, dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    for (int y = (int)(fminf(ay, by) - r) - 1; y <= (int)(fmaxf(ay, by) + r) + 1; y++)
+        for (int x = (int)(fminf(ax, bx) - r) - 1; x <= (int)(fmaxf(ax, bx) + r) + 1; x++) {
+            if (x < 0 || y < 0 || x >= cv->w || y >= cv->h) continue;
+            float px = x + 0.5f - ax, py = y + 0.5f - ay;
+            float k = len2 > 0 ? fminf(fmaxf((px * dx + py * dy) / len2, 0), 1) : 0;
+            float ex = px - k * dx, ey = py - k * dy;
+            if (ex * ex + ey * ey <= r * r) cv->c[y * cv->w + x] = v;
         }
 }
 
@@ -375,6 +407,137 @@ static void draw_directions(Canvas *cv, float x0, float y0, float x1, float y1, 
     }
 }
 
+/* ------------------------------------------------------------------------------------------- controller icons */
+/* A face button: a disc with the label (Xbox letter, PlayStation symbol) cut out. pos: 0 right, 1 bottom, 2 top,
+ * 3 left (the Switch's A, B, X, Y). */
+static void draw_face(Canvas *cv, float cx, float cy, float r, int pos) {
+    fill_ellipse(cv, cx, cy, r, r, 255);
+    if (style == STYLE_XBOX) {
+        static const wchar_t *const letters[4] = {L"B", L"A", L"Y", L"X"};
+        float k = r * 0.62f;
+        cut_text(cv, letters[pos], cx - k, cy - k, cx + k, cy + k);
+        return;
+    }
+    float t = r * 0.2f, k = r * 0.48f;
+    switch (pos) {
+    case 0:  /* circle */
+        fill_ellipse(cv, cx, cy, k + t / 2, k + t / 2, 0);
+        fill_ellipse(cv, cx, cy, k - t / 2, k - t / 2, 255);
+        break;
+    case 1:  /* cross */
+        k *= 0.9f;
+        fill_line(cv, cx - k, cy - k, cx + k, cy + k, t, 0);
+        fill_line(cv, cx - k, cy + k, cx + k, cy - k, t, 0);
+        break;
+    case 2: {  /* triangle */
+        float ax = cx, ay = cy - k * 1.05f, bx = cx - k * 1.05f, by = cy + k * 0.75f, ex = cx + k * 1.05f;
+        fill_line(cv, ax, ay, bx, by, t, 0);
+        fill_line(cv, bx, by, ex, by, t, 0);
+        fill_line(cv, ex, by, ax, ay, t, 0);
+        break;
+    }
+    default:  /* square */
+        k *= 0.82f;
+        fill_rrect(cv, cx - k - t / 2, cy - k - t / 2, cx + k + t / 2, cy + k + t / 2, 0, 0);
+        fill_rrect(cv, cx - k + t / 2, cy - k + t / 2, cx + k - t / 2, cy + k - t / 2, 0, 255);
+        break;
+    }
+}
+
+/* Three bars (menu, options) cut out of a shape, centred at (cx, cy), half width k. */
+static void cut_bars(Canvas *cv, float cx, float cy, float k) {
+    float t = k * 0.28f;
+    for (int i = -1; i <= 1; i++) fill_line(cv, cx - k, cy + i * k * 0.62f, cx + k, cy + i * k * 0.62f, t, 0);
+}
+
+/* A PlayStation glyph (ps5_glyphs.h: Zacksly's "PS5 Button Icons and Controls", CC BY 3.0), its visible part fitted
+ * into the canvas at its own proportions, bilinear. */
+static void blit_glyph(Canvas *cv, int g) {
+    const unsigned char *a = ps5_glyphs[g];
+    enum { N = PS5_GLYPH_SIZE };
+    int bx0 = N, by0 = N, bx1 = -1, by1 = -1;
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++)
+            if (a[y * N + x] > 8) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y; }
+    if (bx1 < 0) return;
+    float gw = (float)(bx1 - bx0 + 1), gh = (float)(by1 - by0 + 1);
+    float k = fminf(cv->w / gw, cv->h / gh), ox = (cv->w - gw * k) / 2, oy = (cv->h - gh * k) / 2;
+    for (int y = 0; y < cv->h; y++)
+        for (int x = 0; x < cv->w; x++) {
+            float u = (x + 0.5f - ox) / k + bx0 - 0.5f, v = (y + 0.5f - oy) / k + by0 - 0.5f;
+            if (u < bx0 - 1 || v < by0 - 1 || u > bx1 + 1 || v > by1 + 1) continue;
+            int iu = (int)floorf(u), iv = (int)floorf(v);
+            float fu = u - iu, fv = v - iv, sum = 0;
+            for (int j = 0; j < 2; j++)
+                for (int i = 0; i < 2; i++) {
+                    int xx = iu + i, yy = iv + j;
+                    float w = (i ? fu : 1 - fu) * (j ? fv : 1 - fv);
+                    if (xx >= 0 && yy >= 0 && xx < N && yy < N) sum += w * a[yy * N + xx];
+                }
+            cv->c[y * cv->w + x] = (uint8_t)(sum + 0.5f);
+        }
+}
+
+/* The controller icon of an action, filling the canvas; false keeps the original icon. */
+static bool draw_pad(Canvas *cv, const Slot *sl) {
+    if (sl->kind != K_KEY || sl >= &slots[sizeof slots / sizeof slots[0] - 4]) return false;  /* (the diagrams) */
+    if (style == STYLE_PS) {
+        int g = sl->arg == IB_A ? PS5_CIRCLE : sl->arg == IB_B ? PS5_CROSS : sl->arg == IB_X ? PS5_TRIANGLE
+              : sl->arg == IB_Y ? PS5_SQUARE : sl->arg == IB_L ? PS5_L1 : sl->arg == IB_R ? PS5_R1
+              : sl->arg == IB_ZL ? PS5_L2 : sl->arg == IB_ZR ? PS5_R2 : sl->arg == IB_PLUS ? PS5_OPTIONS
+              : sl->arg == IB_MINUS ? PS5_CREATE : -1;
+        if (g < 0) return false;
+        blit_glyph(cv, g);
+        return true;
+    }
+    float w = (float)cv->w, h = (float)cv->h, s = fminf(w, h), cx = w / 2, cy = h / 2;
+    bool xbox = style == STYLE_XBOX;
+    switch (sl->arg) {
+    case IB_A: case IB_B: case IB_X: case IB_Y:
+        draw_face(cv, cx, cy, s * 0.49f, sl->arg == IB_A ? 0 : sl->arg == IB_B ? 1 : sl->arg == IB_X ? 2 : 3);
+        return true;
+    case IB_L: case IB_R: case IB_ZL: case IB_ZR: {
+        static const wchar_t *const names[2][4] = {{L"L1", L"R1", L"L2", L"R2"}, {L"LB", L"RB", L"LT", L"RT"}};
+        int i = sl->arg - IB_L;
+        bool trigger = i >= 2;
+        float bw = fminf(w, s * 1.5f), bh = trigger ? s : s * 0.8f;
+        float x0 = cx - bw / 2, y0 = cy - bh / 2, x1 = cx + bw / 2, y1 = cy + bh / 2;
+        /* (bumpers a flat pill, triggers a taller cap rounded on top) */
+        fill_rrect(cv, x0, y0, x1, y1, trigger ? bh * 0.42f : bh * 0.45f, 255);
+        if (trigger) fill_rrect(cv, x0, cy, x1, y1, bh * 0.14f, 255);
+        float p = bh * 0.16f;
+        cut_text(cv, names[xbox][i], x0 + p, y0 + p, x1 - p, y1 - p);
+        return true;
+    }
+    case IB_PLUS: case IB_MINUS: {
+        bool plus = sl->arg == IB_PLUS;
+        if (xbox) {  /* Menu (three bars) and View (two overlapping windows) on a disc */
+            float r = s * 0.49f, k = r * 0.46f, t = r * 0.16f;
+            fill_ellipse(cv, cx, cy, r, r, 255);
+            if (plus) { cut_bars(cv, cx, cy, k); return true; }
+            float a = k * 0.55f, d = k * 0.38f;  /* back window: outline; front window: solid with a gap around it */
+            fill_rrect(cv, cx - d - a - t / 2, cy - d - a - t / 2, cx - d + a + t / 2, cy - d + a + t / 2, 0, 0);
+            fill_rrect(cv, cx - d - a + t / 2, cy - d - a + t / 2, cx - d + a - t / 2, cy - d + a - t / 2, 0, 255);
+            fill_rrect(cv, cx + d - a - t, cy + d - a - t, cx + d + a + t, cy + d + a + t, 0, 255);
+            fill_rrect(cv, cx + d - a, cy + d - a, cx + d + a, cy + d + a, 0, 0);
+            return true;
+        }
+        /* PlayStation Options (three bars) and Create (three short rays) on a disc, as the face buttons */
+        float r = s * 0.49f, k = r * 0.46f, t = r * 0.16f;
+        fill_ellipse(cv, cx, cy, r, r, 255);
+        if (plus) { cut_bars(cv, cx, cy, k); return true; }
+        /* (rays from a point below the centre, starting away from it: a burst, not an arrow) */
+        float ox = cx, oy = cy + k * 0.9f;
+        for (int i = -1; i <= 1; i++) {
+            float dx = sinf(i * 0.7f), dy = -cosf(i * 0.7f);
+            fill_line(cv, ox + dx * k * 0.6f, oy + dy * k * 0.6f, ox + dx * k * 1.75f, oy + dy * k * 1.75f, t, 0);
+        }
+        return true;
+    }
+    }
+    return false;
+}
+
 static void draw_slot(Canvas *cv, const Slot *sl) {
     float x0 = 0, y0 = 0, x1 = (float)cv->w, y1 = (float)cv->h;
     static const int lstick[4] = {IB_LUP, IB_LDOWN, IB_LLEFT, IB_LRIGHT}, rstick[4] = {IB_RUP, IB_RDOWN, IB_RLEFT, IB_RRIGHT},
@@ -403,7 +566,8 @@ static void draw_slot(Canvas *cv, const Slot *sl) {
 /* ---------------------------------------------------------------------------------------------------- the hooks */
 int texpatch_identify(const void *texture) {
     const NvnTexture *t = texture;
-    if (t->format != 0x25 || t->layout.width != ATLAS_W || t->layout.height != ATLAS_H || !t->addr || !enabled()) return -1;
+    if (t->format != 0x25 || t->layout.width != ATLAS_W || t->layout.height != ATLAS_H || !t->addr) return -1;
+    enabled();
     uint64_t total = tegra_total_size(&t->layout);
     if (total != (uint64_t)ATLAS_W * ATLAS_H * 4) return -1;
     /* (a texture of the same size that is not the atlas is asked about at every check: hash it again only when a
@@ -415,20 +579,34 @@ int texpatch_identify(const void *texture) {
     unsigned k = (unsigned)(((uintptr_t)t >> 4) % 16);
     if (seen[k].t == t && seen[k].sample == sample) return -1;
     if (bc7_hash_full(mem, total) != ATLAS_HASH) { seen[k].t = t; seen[k].sample = sample; return -1; }
-    printf("[prompts] button icon atlas found: keyboard and mouse prompts\n");
+    printf("[prompts] button icon atlas found: %s prompts\n", !on ? "Switch" :
+           style == STYLE_XBOX ? "Xbox" : style == STYLE_PS ? "PlayStation" : "keyboard and mouse");
     return 0;
 }
 
-uint32_t texpatch_generation(void) { return 1; }
+uint32_t texpatch_generation(void) { enabled(); return generation; }
+
+static void dump(const uint8_t *data, uint32_t row, const char *name) {
+    const char *dir = getenv("AC_PROMPTS_DUMP");
+    if (!dir || !*dir) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    for (uint32_t y = 0; y < ATLAS_H; y++) fwrite(data + (size_t)y * row, 4, ATLAS_W, f);
+    fclose(f);
+}
 
 void texpatch_apply(int id, uint32_t level, uint8_t *data, uint32_t w, uint32_t h, uint32_t row) {
-    if (id != 0 || level != 0 || w != ATLAS_W || h != ATLAS_H) return;
+    if (id != 0 || level != 0 || w != ATLAS_W || h != ATLAS_H || !enabled()) return;  /* (Switch: as it is) */
+    dump(data, row, "atlas-before.rgba");
     for (unsigned i = 0; i < sizeof slots / sizeof slots[0]; i++) {
         const Slot *sl = &slots[i];
         int sw = sl->x1 - sl->x0 + 1, sh = sl->y1 - sl->y0 + 1;
         Canvas cv = {sw * SS, sh * SS, calloc((size_t)sw * sh, SS * SS)};
         if (!cv.c) return;
-        draw_slot(&cv, sl);
+        if (style == STYLE_KEYBOARD) draw_slot(&cv, sl);
+        else if (!draw_pad(&cv, sl)) { free(cv.c); continue; }
         for (int y = 0; y < sh; y++)
             for (int x = 0; x < sw; x++) {
                 unsigned sum = 0;
@@ -440,4 +618,5 @@ void texpatch_apply(int id, uint32_t level, uint8_t *data, uint32_t w, uint32_t 
             }
         free(cv.c);
     }
+    dump(data, row, "atlas-after.rgba");
 }

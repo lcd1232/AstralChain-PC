@@ -11,6 +11,8 @@
 #include "cpu.h"
 #include "simd.h"
 #include "ipc.h"
+#include <string.h>
+#include "game_settings.h"
 /* Per-call log lines (SVC, IPC, audio and HID traffic): ~300 MB an hour of play. Off in lean (play) builds unless
  * AC_TRACE_CALLS is set; AC_QUIET=1 turns them off in the others. */
 #ifndef LEAN_PAGES
@@ -518,10 +520,10 @@ static double cut_lag_base;static int cut_lag_ok;  /* (svc #0xB1: how far the cu
 static unsigned cut_ends;static double cut_carried;  /* (svc #0xB2, reported at a cutscene's end) */
 static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
  if(imm==0xB1) {
-  static int at30=-1;
+  static int at30;
   static float debt;  /* real time the cutscene picture is behind, in 30 FPS frames */
   static int was;
-  if(at30<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_CUTSCENE_FPS",v,sizeof(v));at30=n && n<sizeof(v) && atoi(v)==30;}
+  {static int fps;SETTING_LIVE(fps,"AC_CUTSCENE_FPS",0);at30=fps==30;}
   int cutscene=!(c->x[21]&1);
   cutscene_mode=cutscene && at30;
   /* Cutscene A/V sync, measured on the cutscene after the highway chase (screenshots and recorded sound against a run

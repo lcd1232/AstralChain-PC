@@ -443,11 +443,16 @@ void *nvn_host_window(void) {
 void nvn_present_pace(int interval) {
  static int override=-2;
  static uint64_t period=320000; /* 19.2 MHz / 60 Hz */
+ static uint64_t origin,last_vsync;
  if(override==-2) {
   char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;
-  n=GetEnvironmentVariableA("AC_FPS_LIMIT",v,sizeof(v));
-  int limit=n && n<sizeof(v) ? atoi(v) : 60;
-  if(limit>=20 && limit<60) {period=19200000ull/(uint64_t)limit;printf("NVN frame limit %d fps\n",limit);}
+ }
+ {  /* (the in-game menu changes it while the game runs) */
+  static int limit=60;
+  SETTING_LIVE(limit,"AC_FPS_LIMIT",60);
+  uint64_t want=limit>=20 && limit<60 ? 19200000ull/(uint64_t)limit : 320000;
+  /* (the slots count in periods: a new period starts the cadence again, else the next slot is seconds away) */
+  if(want!=period) {period=want;origin=0;printf("NVN frame limit %d fps\n",limit>=20 && limit<60 ? limit : 60);}
  }
  static unsigned presents;
  if(!(++presents%60)) {fflush(stdout);fflush(stderr);} /* long runs end by timeout; keep the log current */
@@ -458,7 +463,6 @@ void nvn_present_pace(int interval) {
  extern int cutscene_mode;
  if(cutscene_mode && interval>0 && interval<2 && period==320000) interval=2;
  if(interval<=0) return;
- static uint64_t origin,last_vsync;
  uint64_t now=rt_ticks();
  if(!origin) {origin=now;last_vsync=0;return;}
  /* Adaptive: a frame that missed its slot (last + interval) is shown at once

@@ -30,18 +30,19 @@ static void mouse_clear(void) {
  *   AC_MOUSE_LOOK=0     buttons only, the camera stays on the keys / pad
  *   AC_MOUSE_SENS=<n>   camera sensitivity in percent (default 100)
  *   AC_MOUSE_INVERT=1   moving the mouse up looks down */
-static int mouse_captured,mouse_alt_free,mouse_look_on=-1,mouse_invert;
+static int mouse_captured,mouse_alt_free,mouse_look_on=1,mouse_invert;
 static unsigned mouse_swallow;  /* (buttons held when the mouse was taken: not game input until released) */
 static double mouse_sens=1.0,mouse_acc_x,mouse_acc_y,mouse_vel_x,mouse_vel_y;
 static uint64_t mouse_look_tick,mouse_move_tick,mouse_wheel_until[2],mouse_wheel_gap[2];
 static unsigned mouse_wheel_queue[2];
 static HWND mouse_window;
-static void mouse_config(void) {
- if(mouse_look_on>=0) return;
- const char *e=getenv("AC_MOUSE_LOOK");mouse_look_on=!(e && *e=='0');
- e=getenv("AC_MOUSE_SENS");
- if(e && *e) {double s=atof(e)/100.0;if(s>=0.05 && s<=20) mouse_sens=s;}
- e=getenv("AC_MOUSE_INVERT");mouse_invert=e && *e=='1';
+static void mouse_config(void) {  /* (again when the in-game menu changes a setting: game_settings.h) */
+ static unsigned version=~0u;
+ if(version==settings_version()) return;
+ version=settings_version();
+ mouse_look_on=setting_int("AC_MOUSE_LOOK",1)!=0;
+ double s=setting_int("AC_MOUSE_SENS",100)/100.0;mouse_sens=s>=0.05 && s<=20 ? s : 1.0;
+ mouse_invert=setting_int("AC_MOUSE_INVERT",0)==1;
 }
 static void mouse_clip(void) {
  if(!mouse_captured || !mouse_window) return;

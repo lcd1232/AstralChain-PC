@@ -3119,16 +3119,39 @@ static void gmem_writeback_apply(uint64_t done) {
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    // Astral Chain: the device-local mirror by default. The host-pointer import (AC_VK_HEAP_IMPORT=1) made the
-    // NVIDIA driver log bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19).
+    // Astral Chain: on a discrete GPU the device-local mirror. The host-pointer import made the NVIDIA driver log
+    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). On an integrated GPU the
+    // heap is imported (as the TotK port does): the GPU reads the same system memory, and the mirror was a second copy
+    // of it (2.8 GB on an Intel Arc B390) with the written pages copied in before each submission. A failed import
+    // falls back to the mirror. AC_VK_HEAP_IMPORT=1 / 0 forces either. Not on Linux by default: there the runtime's
+    // write tracking changes page protections of the heap, and on an imported (pinned) range each change made the
+    // driver (Mesa ANV on Xe) pin the pages again: the render thread spent most of its time in the kernel and an Arc
+    // B390 fell from 60 to 8-17 fps (2026-11-01).
     static int import = -1;
-    if (import < 0) import = getenv("AC_VK_HEAP_IMPORT") && g_vk.host_import;
+    if (import < 0) {
+        const char *e = getenv("AC_VK_HEAP_IMPORT");
+#ifdef __linux__
+        bool by_default = false;
+#else
+        bool by_default = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+#endif
+        import = g_vk.host_import && (e ? atoi(e) != 0 : by_default);
+        LOG("[vk] guest heap for shader global memory: %s\n", import ? "imported (no copy)" : "mirrored in device memory");
+    }
     if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL;
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
-    if (!off && want > gmem_size && !(import ? gmem_import(want) : gmem_mirror(want))) {
-        LOG("[vk] guest heap for shader global memory unavailable (%llu MB): reads return zero\n", (unsigned long long)(want >> 20));
-        off = 1;
+    if (!off && want > gmem_size) {
+        bool ok = import && gmem_import(want);
+        if (import && !ok) {
+            LOG("[vk] guest heap import failed: mirrored instead\n");
+            import = 0;
+        }
+        if (!ok) ok = gmem_mirror(want);
+        if (!ok) {
+            LOG("[vk] guest heap for shader global memory unavailable (%llu MB): reads return zero\n", (unsigned long long)(want >> 20));
+            off = 1;
+        }
     }
     if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
     static uint32_t zero[1024];

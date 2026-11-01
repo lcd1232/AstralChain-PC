@@ -113,9 +113,12 @@ namespace AstralChainLauncher
                 "Moving the mouse forward looks down.", OptKind.Check, "0", OptTarget.Game, When("1", "AC_MOUSE_INVERT=1"));
             var prompts = Add("prompts", "Mouse and keyboard", "Button icons in the game",
                 "Keyboard and mouse: the game's button icons show the keys and mouse buttons set in Controls. " +
-                "Switch: the original controller icons (for playing with a controller).",
-                OptKind.Choice, "keyboard", OptTarget.Game, v => v == "switch" ? "AC_PROMPTS=switch" : "");
-            prompts.Choices = new[] { "keyboard|Keyboard and mouse (default)", "switch|Switch controller" };
+                "Xbox, PlayStation: the face buttons, shoulders, triggers and menu buttons of that controller " +
+                "(Xbox also for the Steam Controller). Switch: the original controller icons.",
+                OptKind.Choice, "keyboard", OptTarget.Game,
+                v => v == "xbox" || v == "ps" || v == "switch" ? "AC_PROMPTS=" + v : "");
+            prompts.Choices = new[] { "keyboard|Keyboard and mouse (default)", "xbox|Xbox controller", "ps|PlayStation controller",
+                                      "switch|Switch controller" };
             Add("gpu_warm", "Shaders and performance", "Compile shaders for your GPU before playing",
                 "Takes about 10 s the first time and after driver updates; removes most shader pauses in play.",
                 OptKind.Check, "1", OptTarget.Setup, When("0", "AC_GPU_WARM=0"));

@@ -437,6 +437,7 @@ def main():
     runtime_source = f'#define CALL_LIMIT {args.calls}\n'+constants+RUNTIME.replace('/*MEMORY_TABLE*/',memory.c_table())
     runtime_source = '#include <stddef.h>\n'+runtime_constants(romfs)+runtime_source
     setup = '''\nint main(int argc, char **argv) {
+settings_load();  /* (game_settings.h: the settings file into the environment, before any thread reads it) */
 SetUnhandledExceptionFilter(fatal_fault_handler);
 snapshot_path=argc>1 ? argv[1] : NULL;
 if(BCryptGenRandom(NULL,(PUCHAR)entropy,sizeof(entropy),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0) return 34;

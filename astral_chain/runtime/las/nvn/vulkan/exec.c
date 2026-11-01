@@ -3123,18 +3123,14 @@ static VkDescriptorBufferInfo gmem_info(void) {
     // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). On an integrated GPU the
     // heap is imported (as the TotK port does): the GPU reads the same system memory, and the mirror was a second copy
     // of it (2.8 GB on an Intel Arc B390) with the written pages copied in before each submission. A failed import
-    // falls back to the mirror. AC_VK_HEAP_IMPORT=1 / 0 forces either. Not on Linux by default: there the runtime's
-    // write tracking changes page protections of the heap, and on an imported (pinned) range each change made the
-    // driver (Mesa ANV on Xe) pin the pages again: the render thread spent most of its time in the kernel and an Arc
-    // B390 fell from 60 to 8-17 fps (2026-11-01).
+    // falls back to the mirror. AC_VK_HEAP_IMPORT=1 / 0 forces either. The heap's write tracking stops once it is
+    // imported (nvn_hle.h written_pages): on Linux each tracking query protects the written pages again, and on an
+    // imported (pinned) range each change made the driver (Mesa ANV on Xe) pin the pages again - the render thread
+    // spent most of its time in the kernel and an Arc B390 fell from 60 to 8-17 fps (2026-11-01).
     static int import = -1;
     if (import < 0) {
         const char *e = getenv("AC_VK_HEAP_IMPORT");
-#ifdef __linux__
-        bool by_default = false;
-#else
         bool by_default = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-#endif
         import = g_vk.host_import && (e ? atoi(e) != 0 : by_default);
         LOG("[vk] guest heap for shader global memory: %s\n", import ? "imported (no copy)" : "mirrored in device memory");
     }
@@ -3439,6 +3435,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         }
     }
     if (!vc_on || !gmem_buf || size > VC_MAX_RANGE) return false;
+    if (!gmem_alloc) return false;  // (imported heap: no write tracking then, the GPU reads the vertices in place)
     uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     if (hi > gmem_size) return false;
     uint64_t pend = vk_pending_seq();

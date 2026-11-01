@@ -2912,6 +2912,11 @@ static void gmem_sync(void) {
 typedef struct { uint64_t seq, addr, size; VkBuffer buf; VmaAllocation mem; void *ptr; } GmemWb;
 static GmemWb wb_pending[64], wb_flight[256];
 static int wb_npend, wb_nflight;
+// wb_flight and the lazy write-back tables below: the submitting thread adds (gmem_wb_record), whichever thread sees a
+// submission complete applies (gmem_writeback_apply, from renderer_seq_done: with AC_ASYNC_SUBMIT the game's thread
+// waiting on a fence while the worker submits). Unlocked, the two met: an entry applied twice, its staging buffer
+// destroyed twice, glibc's heap corrupted ("corrupted size vs. prev_size", 2026-11-02).
+static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
 static void gmem_wb_note(uint64_t addr, uint64_t size) {
     if (!gmem_alloc || !size || addr < HEAP_BASE || addr - HEAP_BASE + size > gmem_size) return;
     for (int i = 0; i < wb_npend; i++)
@@ -2933,8 +2938,10 @@ static void gmem_wb_record(VkCommandBuffer cb, uint64_t seq) {
         w->seq = seq;
         VkBufferCopy cp = {w->addr - HEAP_BASE, 0, w->size};
         vkCmdCopyBuffer(cb, gmem_buf, w->buf, 1, &cp);
+        pthread_mutex_lock(&lazy_lock);
         if (wb_nflight == 256) FATAL("heap mirror: too many GPU write-backs in flight\n");
         wb_flight[wb_nflight++] = *w;
+        pthread_mutex_unlock(&lazy_lock);
     }
     wb_npend = 0;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
@@ -2959,7 +2966,6 @@ static Lazy lazy_tab[LAZY_MAX], lazy_free[LAZY_MAX];
 static int lazy_nfree;
 static struct { uint64_t addr, size; } lazy_hot[LAZY_HOT_MAX];  // ranges the CPU reads: eager write-back
 static int lazy_nhot;
-static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
 extern int nvn_page_protect(uint64_t addr, uint64_t size, int noaccess);
 extern void (*nvn_lazy_flush_hook)(uint64_t addr, uint64_t size);
 extern int (*nvn_lazy_fault_hook)(uint64_t addr);

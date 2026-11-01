@@ -180,8 +180,40 @@ _JUMP_TAIL = re.compile(r'c->pc=(\d+)ull; break; \}$')
 _COND_TAIL = re.compile(r'c->pc=\((.*)\) \? (\d+)ull : (\d+)ull; break; \}$')
 
 
+# Spin waits: a conditional branch back over at most SPIN_MAX instructions that only load from unchanging addresses and
+# compare - the game's spin locks and flag waits, e.g. `ldr w8, [x19]; cbnz w8, <the ldr>`. The Switch's cores spin on
+# them as they are; on a PC the spinning core takes the power budget the others need (an Intel laptop ran into its
+# power limit with one game thread spinning half of the time), and a hyper-thread sibling slows. The taken branch gets
+# a pause instruction (the x86 spin-wait hint): the same loop, a little slower to notice the change, much less power.
+# A loop that moves a pointer or counts (a string scan, a search) is no wait and keeps its speed: the body may hold
+# only loads without write-back whose base register the loop does not write, and compares that set flags only.
+SPIN_MAX = 4
+_SPIN_LOAD = re.compile(r'^\{ \{ uint64_t ea = c->x\[(\d+)\](?: \+ 0x[0-9a-f]+ull)?; uint64_t v = LD(?:8|16|32|64)\(ea\); '
+                        r'c->x\[(\d+)\] = \(uint64_t\)\(v\); \} \}$')
+_SPIN_COMPARE = re.compile(r'^\{ (?:\(void\)\((?:subs|adds|ands)(?:32|64)\(c, [^;]*\)\);'
+                           r'|if \(COND_\w+\(c\)\) \(void\)(?:subs|adds)(?:32|64)\(c, [^;]*\); else c->nzcv = 0x[0-9a-f]+ull;) \}$')
+
+
+def _spin_wait(by_pc, at, target):
+    if not (0 < at - target <= 4 * SPIN_MAX):
+        return False
+    bases, written, loads = set(), set(), 0
+    for pc in range(target, at, 4):
+        text = by_pc.get(pc)
+        if text is None:
+            return False
+        body = re.sub(r'^(?:L_[0-9a-f]+: )?case \d+ull: ', '', text).strip()
+        m = _SPIN_LOAD.match(body)
+        if m:
+            bases.add(m.group(1)); written.add(m.group(2)); loads += 1
+        elif not _SPIN_COMPARE.match(body):
+            return False
+    return loads > 0 and not bases & written
+
+
 def _local_jumps(cases, page):
     labels = {int(t[5:t.index('ull')]) for t in cases}
+    by_pc = {int(t[5:t.index('ull')]): t for t in cases}
     used, out = set(), []
     def go(target):
         if target in labels:
@@ -191,7 +223,9 @@ def _local_jumps(cases, page):
     for text in cases:
         m = _COND_TAIL.search(text)
         if m and (int(m.group(2)) in labels or int(m.group(3)) in labels):
-            text = text[:m.start()] + f'if ({m.group(1)}) {{ {go(int(m.group(2)))} }} {go(int(m.group(3)))} }}'
+            at, taken = int(text[5:text.index('ull')]), int(m.group(2))
+            pause = '__builtin_ia32_pause(); ' if _spin_wait(by_pc, at, taken) else ''
+            text = text[:m.start()] + f'if ({m.group(1)}) {{ {pause}{go(taken)} }} {go(int(m.group(3)))} }}'
         else:
             m = _JUMP_TAIL.search(text)
             if m and int(m.group(1)) in labels:

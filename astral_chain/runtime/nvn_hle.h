@@ -192,7 +192,7 @@ static int hle_intercept(Cpu *c) {
 #endif
   /* Lean builds have no cooperative checkpoints in translated code: parallel mode only. */
   parallel_mode=LEAN_PAGES || GetEnvironmentVariableA("AC_PARALLEL",NULL,0)!=0;
-  if(parallel_mode) {live_cpu[0]=&state;printf("PARALLEL guest threads on host threads\n");}
+  if(parallel_mode) {live_cpu[0]=&state;printf("PARALLEL guest threads on host threads\n");cpu_place_register(0,NULL);}
   return hle_intercept_body(c);
  }
  if(!parallel_mode) return hle_intercept_body(c);

@@ -343,6 +343,7 @@ static DWORD WINAPI parallel_thread_main(LPVOID parameter) {
  current_thread=i;state=guest_threads[i].cpu;  /* (initial context from svcCreateThread) */
  klock();live_cpu[i]=&state;kunlock();
  prof_attach(i);
+ cpu_place_register(i,NULL);
  guest_execute(&state);  /* returns only at the host return sentinel; guest threads end with svcExitThread */
  klock();guest_threads[i].status=THREAD_EXITED;kunlock();
  return 0;

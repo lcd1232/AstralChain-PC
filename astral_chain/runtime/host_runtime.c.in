@@ -405,6 +405,7 @@ static void close_library_applet(void) {
 #include "hid_service.h"
 #include "time_service.h"
 #include "app_window.h"
+#include "cpu_placement.h"
 #include "guest_threads.h"
 #include "controller_applet.h"
 #include "swkbd_applet.h"

@@ -517,6 +517,9 @@ class App:
         style.configure('.', font=base_font)
         style.configure('Big.TButton', font=('Sans', int(14 * scale), 'bold'), padding=(24, 10))
         style.configure('TButton', padding=(10, 6))
+        # (clam's bar is a light gray on a gray trough: hard to read at a glance on the Deck)
+        style.configure('Horizontal.TProgressbar', background='#3d7fd6', lightcolor='#5a95e0', darkcolor='#2f69b8',
+                        bordercolor='#9a9a9a', troughcolor='#f2f2f2', thickness=int(14 * scale))
 
         outer = ttk.Frame(root, padding=14)
         outer.pack(fill='both', expand=True)

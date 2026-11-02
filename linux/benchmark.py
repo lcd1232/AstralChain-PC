@@ -74,7 +74,8 @@ class Game:
         env = L.game_env(config)
         env.update(AC_DATA_DIR='Z:' + str(self.run_dir).replace('/', '\\'),  # (the save root is a Windows path)
                    AC_INPUT_FILE=str(self.pad), AC_IGNORE_FOCUS='1', AC_VIBRATION='0',
-                   AC_FULLSCREEN='1' if fullscreen else '0', LARECOMP_FPS_INTERVAL='1')
+                   AC_FULLSCREEN='1' if fullscreen else '0', LARECOMP_FPS_INTERVAL='1',
+                   AC_CPU_PLACEMENT_LOG='1')
         env.update(extra)
         game = home/'build'/'game'
         r0 = game/'round-00'
@@ -84,6 +85,8 @@ class Game:
         self.process = subprocess.Popen([str(r0/'trace.exe'), str(r0/'relocations.bin')], cwd=game, env=env,
                                         stdout=self.out, stderr=self.err)
         self.reader = open(self.err_path, encoding='utf-8', errors='replace')
+        self.trace_reader = open(log_dir/'trace.log', encoding='utf-8', errors='replace')
+        self.work = []
         self.lines = []
 
     def poll(self):
@@ -95,6 +98,9 @@ class Game:
                 t, frame, fps, worst, draws = float(m[1]), int(m[2]), float(m[3]), int(m[4]), int(m[5])
                 new.append((t, frame, fps, worst, draws / max(fps, 1.0)))
         self.lines += new
+        for text in self.trace_reader.readlines():  # cpu_placement.h: each thread's work a second, less spin waits
+            if text.startswith('[cpu] work:'):
+                self.work.append({k: float(v) for k, v in (w.split('=') for w in text.split(':', 1)[1].split())})
         return new
 
     def hold(self, mask, seconds):
@@ -158,17 +164,25 @@ def measure(game, seconds, mask=0):
     game.poll()
     if mask:
         game.pad.write_text(f'{mask:x}')
-    first = len(game.lines)
+    first, first_work = len(game.lines), len(game.work)
     time.sleep(seconds)
     game.pad.write_text('0')
     game.poll()
-    lines = game.lines[first:]
+    lines, work = game.lines[first:], game.work[first_work + 1:]
     if len(lines) < 2:
         return None
     frames = lines[-1][1] - lines[0][1]
     elapsed = lines[-1][0] - lines[0][0]
-    return {'fps': frames / elapsed if elapsed > 0 else 0.0, 'min_fps': min(x[2] for x in lines[1:]),
-            'worst_ms': max(x[3] for x in lines[1:]), 'draws': sum(x[4] for x in lines[1:]) / (len(lines) - 1)}
+    fps = frames / elapsed if elapsed > 0 else 0.0
+    # CPU milliseconds a frame of the busiest threads (g<n>: guest thread n, r0: the render worker)
+    threads = {}
+    for w in work:
+        for k, v in w.items():
+            threads[k] = threads.get(k, 0.0) + v
+    busy = {k: 1000.0 * v / len(work) / fps for k, v in threads.items()} if work and fps else {}
+    return {'fps': fps, 'min_fps': min(x[2] for x in lines[1:]),
+            'worst_ms': max(x[3] for x in lines[1:]), 'draws': sum(x[4] for x in lines[1:]) / (len(lines) - 1),
+            'ms': dict(sorted(busy.items(), key=lambda kv: -kv[1])[:4])}
 
 
 def one_run(config, home, extra, args, log_dir):
@@ -242,6 +256,8 @@ def main():
                 if r:
                     print(f'  {part:5}: {r["fps"]:5.1f} fps (lowest second {r["min_fps"]:4.1f}, worst frame '
                           f'{r["worst_ms"]} ms, {r["draws"]:.0f} draws a frame)', flush=True)
+                    if r['ms']:
+                        print('         CPU ms a frame: ' + ', '.join(f'{k} {v:.1f}' for k, v in r['ms'].items()), flush=True)
             results.append({'label': label, 'env': extra, 'still': still, 'turn': turn, 'log': str(log_dir)})
     if len(results) > 1:
         print('\nSummary (mean of the runs):')
@@ -252,6 +268,9 @@ def main():
                 values = [r[part]['fps'] for r in mine if r[part]]
                 if values:
                     parts.append(f'{part} {sum(values) / len(values):5.1f} fps ({", ".join(f"{v:.1f}" for v in values)})')
+                busiest = [max(r[part]['ms'].values()) for r in mine if r[part] and r[part]['ms']]
+                if busiest:
+                    parts.append(f'busiest thread {sum(busiest) / len(busiest):4.1f} ms')
             print(f'  {label:30} ' + '   '.join(parts))
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=1))

@@ -355,7 +355,7 @@ def build_game():
                '--instructions', '4000000', '--sample-steps', '0', '--run-timeout', '86400', '--unbounded', '--chain',
                '--follow', '0', '--entry', 'rtld:start', '--seed-all-text', '--build', 'cached',
                '--control', CONTROL, '--romfs', ROMFS_IMAGE, '--nvn-hle', '--nvn-backend', 'vulkan',
-               '--optimize', '--lean', '--direct-calls', '--jumps']
+               '--optimize', '--lean', '--direct-calls', '--jumps', '--entry-labels', '--restrict']
     for patch in PATCHES:
         command += ['--patch', patch]
     if game_language():

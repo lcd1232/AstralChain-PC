@@ -185,6 +185,19 @@ static void nvn_lock(void) {
  nvn_owner=me;nvn_depth=1;
 }
 static void nvn_unlock(void) {if(--nvn_depth==0) {nvn_owner=0;ReleaseSRWLockExclusive(&nvn_srw);}}
+#define NVN_MAIN_FUNCS 1024
+static uint64_t nvn_main_qpc[NVN_MAIN_FUNCS],nvn_main_calls[NVN_MAIN_FUNCS];
+static void nvn_main_report(double qpc_hz) {
+ printf("; main thread's slowest nvn calls (ms, calls):");
+ for(int k=0;k<6;k++) {
+  unsigned best=0;uint64_t most=0;
+  for(unsigned i=0;i<NVN_MAIN_FUNCS && i<nvn_thunk_count;i++) if(nvn_main_qpc[i]>most) {most=nvn_main_qpc[i];best=i;}
+  if(!most) break;
+  printf(" %s %.1f %llu",nvn_thunks[best].name,1000.0*(double)most/qpc_hz,(unsigned long long)nvn_main_calls[best]);
+  nvn_main_qpc[best]=0;
+ }
+ memset(nvn_main_qpc,0,sizeof(nvn_main_qpc));memset(nvn_main_calls,0,sizeof(nvn_main_calls));
+}
 static int hle_intercept(Cpu *c) {
  if(!nvn_hle_configured) {
 #ifndef LEAN_PAGES
@@ -211,6 +224,11 @@ static int hle_intercept(Cpu *c) {
  if(nvn) nvn_unlock(); else kunlock();
  if(timed && nvn && current_thread<33) {
   QueryPerformanceCounter(&t1);nvn_thread_qpc[current_thread]+=(uint64_t)(t1.QuadPart-t0.QuadPart);nvn_thread_calls[current_thread]++;
+  /* the main thread's calls by function (AC_PARALLEL_STATS: the slowest in the stats line) */
+  if(current_thread==0 && pc>=NVN_HLE_BASE) {
+   unsigned f=(unsigned)((pc-NVN_HLE_BASE)/NVN_HLE_STRIDE);
+   if(f<NVN_MAIN_FUNCS) {nvn_main_qpc[f]+=(uint64_t)(t1.QuadPart-t0.QuadPart);nvn_main_calls[f]++;}
+  }
  }
  if(guest_threads[current_thread].status!=THREAD_RUNNABLE) {klock();parallel_block();kunlock();}
  return handled;

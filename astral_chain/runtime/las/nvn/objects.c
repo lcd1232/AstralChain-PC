@@ -134,8 +134,10 @@ static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t aq_more = PTHREAD_COND_INITIALIZER, aq_less = PTHREAD_COND_INITIALIZER;
 uint64_t nvn_async_drains, nvn_async_waits;  // (stats)
 
+void cpu_place_register(unsigned slot, const char *name);  // (runtime/cpu_placement.h: performance cores on hybrid CPUs)
 static void *aq_worker(void *arg) {
     (void)arg;
+    cpu_place_register(0, "render worker");
     for (;;) {
         pthread_mutex_lock(&aq_lock);
         while (aq_head == aq_tail) pthread_cond_wait(&aq_more, &aq_lock);

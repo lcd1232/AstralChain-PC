@@ -185,6 +185,7 @@ _COND_TAIL = re.compile(r'c->pc=\((.*)\) \? (\d+)ull : (\d+)ull; break; \}$')
 # them as they are; on a PC the spinning core takes the power budget the others need (an Intel laptop ran into its
 # power limit with one game thread spinning half of the time), and a hyper-thread sibling slows. The taken branch gets
 # a pause instruction (the x86 spin-wait hint): the same loop, a little slower to notice the change, much less power.
+# It also adds its time to rt_spin_tsc: runtime/cpu_placement.h tells a thread that waits from one that works.
 # A loop that moves a pointer or counts (a string scan, a search) is no wait and keeps its speed: the body may hold
 # only loads without write-back whose base register the loop does not write, and compares that set flags only.
 SPIN_MAX = 4
@@ -224,7 +225,8 @@ def _local_jumps(cases, page):
         m = _COND_TAIL.search(text)
         if m and (int(m.group(2)) in labels or int(m.group(3)) in labels):
             at, taken = int(text[5:text.index('ull')]), int(m.group(2))
-            pause = '__builtin_ia32_pause(); ' if _spin_wait(by_pc, at, taken) else ''
+            pause = ('{ extern __thread unsigned long long rt_spin_tsc, rt_spin_last; unsigned long long t = __builtin_ia32_rdtsc(); '
+                     'if (t - rt_spin_last < 20000) rt_spin_tsc += t - rt_spin_last; rt_spin_last = t; } __builtin_ia32_pause(); ') if _spin_wait(by_pc, at, taken) else ''
             text = text[:m.start()] + f'if ({m.group(1)}) {{ {pause}{go(taken)} }} {go(int(m.group(3)))} }}'
         else:
             m = _JUMP_TAIL.search(text)

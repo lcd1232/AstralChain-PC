@@ -18,6 +18,7 @@ import json
 import locale
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -145,6 +146,32 @@ TEXT = {
     'group_mouse': ('Mouse and keyboard', 'Мышь и клавиатура'),
     'group_trouble': ('Troubleshooting', 'Устранение неполадок'),
 }
+
+
+# The setup's output (setup_game.py): "== Step" headers, and "  Label: done/total" progress lines (rewritten in place
+# in a terminal; one line each here). Shown above the log as the current step, its progress and its time so far.
+PROGRESS_LINE = re.compile(r'^\s*(\S.*?): (\d+)/(\d+)\s*$')
+STEP_RU = {
+    'Downloading': 'Загрузка', 'Building the RomFS packer': 'Сборка упаковщика RomFS',
+    'Extracting the game metadata': 'Извлечение данных об игре', 'Extracting the update code': 'Извлечение кода обновления',
+    'Extracting the game data': 'Распаковка данных игры (около 10 ГБ, это небыстро)',
+    'Packing the game data': 'Упаковка данных игры', 'Building the game': 'Сборка игры (первая сборка идёт несколько минут)',
+    'Preparing shaders': 'Подготовка шейдеров', 'Preparing BC7 textures': 'Подготовка текстур BC7 (один раз, около 16 ГБ)',
+    'Reading the base game': 'Чтение базовой игры', 'Reading the update': 'Чтение обновления',
+    'Removing temporary files': 'Удаление временных файлов',
+    'Translating the game code': 'Перевод кода игры', 'Compiling the game': 'Компиляция игры',
+    'Linking the game': 'Компоновка игры', 'Compiling for your GPU': 'Компиляция шейдеров для видеокарты',
+    'Converting textures to BC7': 'Преобразование текстур в BC7',
+}
+
+
+def step_text(text):
+    if not RU:
+        return text
+    for english, russian in STEP_RU.items():
+        if text.startswith(english):
+            return russian + text[len(english):] if text[len(english):].startswith(':') else russian
+    return text
 
 
 def t(key, **kw):
@@ -525,8 +552,11 @@ class App:
 
         self.status = tk.StringVar(value=t('st_busy'))
         ttk.Label(outer, textvariable=self.status, wraplength=900).pack(anchor='w')
-        self.progress = ttk.Progressbar(outer, mode='indeterminate')
+        self.step = tk.StringVar(value='')  # (the setup's current step, its progress and time: on_line)
+        self.step_label = ttk.Label(outer, textvariable=self.step, wraplength=900)
+        self.progress = ttk.Progressbar(outer, mode='indeterminate', maximum=100)
         self.progress.pack(fill='x', pady=(6, 8))
+        self.step_name, self.step_detail, self.step_started, self.last_progress = '', '', 0.0, None
         # the log appears with the first line written to it (Install, a failed start), not before
         self.log_label = ttk.Label(outer, text=t('log'))
         self.logframe = logframe = ttk.Frame(outer)
@@ -540,12 +570,58 @@ class App:
         self.refresh()
 
     # ---- helpers
-    def write(self, text):
+    def set_bar(self, fraction):
+        """Progress bar: a fraction done, or None (moving: no count known)."""
+        if fraction is None:
+            if str(self.progress.cget('mode')) != 'indeterminate':
+                self.progress.configure(mode='indeterminate', value=0)
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.configure(mode='determinate', value=max(0.0, min(100.0, fraction * 100)))
+
+    def show_step(self):
+        if not self.step_name and not self.step_detail:
+            return
+        if not self.step_label.winfo_manager():
+            self.step_label.pack(anchor='w', before=self.progress)
+        elapsed = int(time.monotonic() - self.step_started)
+        clock = f'{elapsed // 60}:{elapsed % 60:02d}'
+        self.step.set('  ·  '.join(x for x in (self.step_name, self.step_detail, clock) if x))
+
+    def on_line(self, line):
+        """A line of the setup's output: the step and progress above the log, then the log."""
+        match = PROGRESS_LINE.match(line)
+        if line.startswith('== '):
+            self.step_name, self.step_detail, self.step_started, self.last_progress = step_text(line[3:]), '', time.monotonic(), None
+            self.set_bar(None)
+        elif match:
+            label, done, total = match.group(1), int(match.group(2)), int(match.group(3))
+            if total:
+                self.step_detail = f'{step_text(label)}: {done}/{total} ({100 * done // total}%)'
+                self.set_bar(done / total)
+            self.write(line, replace=self.last_progress == label)
+            self.last_progress = label
+            self.show_step()
+            return
+        elif line.startswith('  ') and line.strip() and not line.strip()[0].isdigit():
+            # a sub-step without a count ("  Linking the game", BC7 conversion so far): moving bar
+            self.step_detail = step_text(line.strip())
+            self.set_bar(None)
+        if not line.strip() and self.last_progress:
+            return  # (the end of a run of progress lines)
+        self.last_progress = None
+        self.write(line)
+        self.show_step()
+
+    def write(self, text, replace=False):
         if not self.logframe.winfo_manager():
             self.log_label.pack(anchor='w')
             self.logframe.pack(fill='both', expand=True)
             self.root.minsize(760, 560)
         self.log.configure(state='normal')
+        if replace:  # (the same progress line again: in place of the previous one)
+            self.log.delete('end-2l linestart', 'end-1c')
         self.log.insert('end', text if text.endswith('\n') else text + '\n')
         self.log.see('end')
         self.log.configure(state='disabled')
@@ -577,9 +653,13 @@ class App:
         self.install_button.configure(state=state)
         self.cancel_button.configure(state='normal' if busy else 'disabled')
         if busy:
-            self.progress.start(12)
+            self.step_name, self.step_detail, self.step_started, self.last_progress = '', '', time.monotonic(), None
+            self.set_bar(None)
         else:
             self.progress.stop()
+            self.progress.configure(mode='determinate', value=0)
+            if self.step_label.winfo_manager():
+                self.step_label.pack_forget()
         if text:
             self.status.set(text)
 
@@ -609,7 +689,7 @@ class App:
                 self.process = subprocess.Popen(command, cwd=CODE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                 text=True, errors='replace', bufsize=1, start_new_session=True)
                 for line in self.process.stdout:
-                    self.events.put(('line', line.rstrip('\n')))
+                    self.events.put(('setup', line.rstrip('\n')))
                 code = self.process.wait()
             except OSError as error:
                 self.events.put(('line', str(error)))
@@ -622,7 +702,9 @@ class App:
         try:
             while True:
                 kind, value = self.events.get_nowait()
-                if kind == 'line':
+                if kind == 'setup':
+                    self.on_line(value)
+                elif kind == 'line':
                     self.write(value)
                 elif kind == 'status':
                     if not self.busy:
@@ -633,6 +715,8 @@ class App:
                         then(code)
         except queue.Empty:
             pass
+        if self.busy and self.step_name:
+            self.show_step()  # (the step's clock)
         self.poll_id = self.root.after(100, self.poll)
 
     # ---- actions
@@ -669,6 +753,10 @@ class App:
             self.set_busy(False, t('st_failed'))
             return
         self.status.set(t('st_playing'))
+        self.step_name = self.step_detail = ''
+        if self.step_label.winfo_manager():
+            self.step_label.pack_forget()
+        self.set_bar(None)
         self.root.iconify() if not DECK else None
 
         def work():

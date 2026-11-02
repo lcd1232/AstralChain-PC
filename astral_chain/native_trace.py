@@ -642,6 +642,7 @@ if(BCryptGenRandom(NULL,(PUCHAR)entropy,sizeof(entropy),BCRYPT_USE_SYSTEM_PREFER
             for module in image.modules:
                 seeds.extend(target for target in adjacent_code_targets(module,pointer_observed) if target not in known)
         nodes={} if args.dispatch=='blocks' else None
+        print('  Translating the game code',flush=True)
         pages, translation = translate(image, reference, seeds, args.instructions,nodes,all_text=args.seed_all_text)
         if args.lean and args.jumps and args.entry_labels:
             from . import native_trace as imported

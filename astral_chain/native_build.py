@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import threading
 
 from .containers import FormatError
 from . import host
@@ -94,9 +95,18 @@ def build(compiler,reference,units,source,folder,cache,workers=4,extra_objects=(
         result.check_returncode()
         manifest.write_text(json.dumps({'key':key,'sha256':digest_file(obj),'provenance':provenance},indent=2)+'\n',encoding='utf-8')
         return group,obj,False
+    # (progress for the launcher window, launcher.py: "label: done/total" lines, rewritten in place in a terminal)
+    lock=threading.Lock();done=[0]
+    def counted(item):
+        result=compile_unit(item)
+        with lock:
+            done[0]+=1
+            print(f'\r  Compiling the game: {done[0]}/{len(units)}',end='',flush=True)
+        return result
     # Distinct groups have distinct emitted page names, hence distinct keys.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        compiled=list(executor.map(compile_unit,sorted(units.items())))
+        compiled=list(executor.map(counted,sorted(units.items())))
+    print('\n  Linking the game',flush=True)
     src=folder/'trace.c';src.write_text(source,encoding='utf-8')
     # 64 MB main-thread stack (host.main_flags): direct calls nest page functions along guest calls
     command=[str(compiler),'cc',*FLAGS,*host.shim_include(),'-I',str(Path(__file__).parent/'runtime'),'-I',str(reference/'runtime'),

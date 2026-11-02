@@ -9,7 +9,7 @@
   --compiler tools\zig\zig.exe --output build\<new folder> --instructions 4000000 --sample-steps 0 `
   --run-timeout 86400 --unbounded --chain --follow 0 --entry rtld:start --seed-all-text --build cached `
   --control game\control.nacp --romfs game\romfs.bin --nvn-hle --nvn-backend vulkan `
-  --optimize --lean --direct-calls --jumps `
+  --optimize --lean --direct-calls --jumps --entry-labels --restrict `
   --patch third_party\AstralChain-Dynamic-FPS\1.0.1.pchtxt --patch astral_chain\patches\cutscene-catchup-1.0.1.pchtxt `
   --build-only
 powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 300 -Env "AC_PARALLEL=1"
@@ -21,6 +21,15 @@ powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 3
 - Each build writes `run-env.txt`, holding addresses that move with `main`'s size, and `run_guarded.ps1` reads
   it.
 - Always run through `run_guarded.ps1`.
+- `--entry-labels`: a page function's switch has a case only where execution can enter from outside (branch and
+  call targets from other pages, return addresses, code pointers of the relocations and symbols, jump-table
+  targets, loop heads, the instruction after an unconditional jump), so the compiler optimizes across the code
+  between them; each page also gets an unoptimized fallback function with every instruction, for an entry the
+  analysis missed, which returns at the next entry. `AC_FALLBACK_LOG=1` prints the most frequent fallback entries.
+  With `--restrict` (the Cpu pointer does not alias guest memory), a busy scene's main thread took 11.1 ms a frame
+  instead of 13.3 (`linux/benchmark.py`, 2026-11-02). The executable is about twice as large.
+- `linux/benchmark.py`: a repeatable frame-rate run from a frozen save (`--capture-save` first); prints each busy
+  thread's CPU milliseconds a frame. `--variants`/`--env` compare settings.
 
 ## Unattended test runs
 

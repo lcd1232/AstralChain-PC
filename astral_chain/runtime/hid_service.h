@@ -267,6 +267,7 @@ static void hid_publish(uint64_t now,int focused) {
  if(previous!=(connected ? 1u : 0u) && hid_style_events[0] && !SetEvent(hid_style_events[0]))
   boundary("hid-style-event",&state,state.pc);
  HidSample sample={0};sample.sample=++hid_sampling;sample.attributes=connected ? 3 : 0;
+ int gated=0;uint64_t raw=0;
  mouse_wheel_step(now);
  if(connected && focused) {
   hid_keys_load();
@@ -294,7 +295,23 @@ static void hid_publish(uint64_t now,int focused) {
   if(scripted&(1ull<<17)) sample.ly=32767;
   if(scripted&(1ull<<19)) sample.ly=-32767;
   /* (Minus and Plus together open the menu; while it is open, and until what was held is let go, no game input) */
-  if(menu_pad_gate && menu_pad_gate(sample.buttons,sample.lx,sample.ly)) {sample.buttons=0;sample.lx=sample.ly=sample.rx=sample.ry=0;}
+  gated=menu_pad_gate && menu_pad_gate(sample.buttons,sample.lx,sample.ly);
+  raw=sample.buttons;
+  if(gated) {sample.buttons=0;sample.lx=sample.ly=sample.rx=sample.ry=0;}
+ }
+ /* AC_INPUT_LOG=1: each change of the buttons the game gets (hex, bit 8 ZL, bit 9 ZR), with the time and why input
+  * was held back (window not focused: no pad or keyboard input; the in-game menu open or its buttons still held). */
+ {
+  static int on=-1;static uint64_t last=~0ull,origin;static int last_focus=-1,last_gated=-1;
+  if(on<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_INPUT_LOG",v,sizeof(v));on=n && n<sizeof(v) && atoi(v);}
+  if(on && (sample.buttons!=last || focused!=last_focus || gated!=last_gated)) {
+   if(!origin) origin=now;
+   printf("HID input t=%.3f buttons=0x%llx",(double)(now-origin)/19200000.0,(unsigned long long)sample.buttons);
+   if(!focused) printf(" (window not focused)");
+   if(gated) printf(" (held back by the menu; pressed 0x%llx)",(unsigned long long)raw);
+   printf("\n");fflush(stdout);
+   last=sample.buttons;last_focus=focused;last_gated=gated;
+  }
  }
  hid_ring_write((HidRing*)(npad+0x28),&sample);
  hid_ring_write((HidRing*)(npad+0x1408),&sample);

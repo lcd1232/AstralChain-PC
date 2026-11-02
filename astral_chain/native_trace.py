@@ -173,22 +173,6 @@ def _direct_call(text, called):
     return text[:m.start()] + f'c->x[30]={m.group(1)}ull; c->pc={target}ull; page_{target >> 12:x}(c); break; }}'
 
 
-# Lean builds with --direct-calls: an indirect call (BLR: virtual methods, function pointers) whose return address is
-# in the same page runs its callee through guest_run_until (emit_execute), a dispatch loop that comes back when the guest
-# returns, so the caller's page goes on where it was. Before, the call left the caller's page function for execute()
-# and the return entered it again through its switch: two trips through the page dispatcher per virtual call.
-GUEST_CALLS = False
-_BLR_TAIL = re.compile(r'c->x\[30\]=(\d+)ull; c->pc=target; break; \}$')
-
-
-def _guest_call(text, page):
-    m = _BLR_TAIL.search(text)
-    if not m or int(m.group(1)) >> 12 != page:
-        return text, False
-    ret = m.group(1)
-    return text[:m.start()] + f'c->x[30]={ret}ull; c->pc=target; guest_run_until(c,{ret}ull); break; }}', True
-
-
 # Lean builds with --jumps: a branch to a case of the same page jumps there directly (goto) instead of leaving
 # the case for the page loop's switch (an indirect jump per taken branch). c->pc is still set, so exits work.
 PAGE_JUMPS = False
@@ -256,19 +240,12 @@ def emit_page(page,cases,limit,stop_at=None,external=False,chain=False):
         called=set()
         if DIRECT_PAGES and external:  # (cached builds: page functions are external symbols)
             cases=[_direct_call(text,called) for text in cases]
-        uses_guest_call=False
-        if GUEST_CALLS and external:
-            out=[]
-            for text in cases:
-                text,used=_guest_call(text,page);uses_guest_call|=used;out.append(text)
-            cases=out
         if PAGE_JUMPS:
             cases=sorted(cases,key=lambda text:int(text[5:text.index('ull')]))
             if chain: cases=chain_cases(cases)
             cases=_local_jumps(cases,page)
             chain=False  # (already chained)
         protos=''.join(f'void page_{p:x}(Cpu*);\n' for p in sorted(called - {page}))
-        if uses_guest_call: protos+='void guest_run_until(Cpu*,uint64_t);\n'
         parts=[f'{protos}{"" if external else "static "}__attribute__((noinline)) void page_{page:x}(Cpu *{PAGE_RESTRICT}c) {{\nwhile((c->pc>>12)=={page}ull) {{\nswitch(c->pc) {{']
         parts.extend(cases if PAGE_JUMPS else chain_cases(cases) if chain else sorted(cases))  # (--jumps: ordered and chained above)
         parts.append('default: boundary("untranslated",c,c->pc);\n} } }')
@@ -296,18 +273,6 @@ def emit_execute(pages,stop_at=None):
     for page in sorted(pages):
         parts.append(f'case {page}ull: page_{page:x}(c); break;')
     parts.append('default: boundary("untranslated",c,c->pc); } } }')
-    if GUEST_CALLS:
-        # The callee of an indirect call (_guest_call, guest_run_until), run until it returns to `ret`. Nested at most GUEST_CALL_DEPTH
-        # deep (a call that never returns - an unwind, a thread that ends - leaves its frame behind: the cap bounds
-        # the host stack); beyond, the caller leaves its page for execute() as before. The program's end
-        # (0x7fffffffffff) and anything that leaves the loop go back through the caller to execute().
-        parts.append('static __thread int guest_run_depth;')
-        parts.append('void guest_run_until(Cpu *c, uint64_t ret) { if(guest_run_depth>=48) return; guest_run_depth++; '
-                     'while(c->pc!=ret) { if(thread_reschedule) thread_checkpoint(c,executed_steps); '+stop+
-                     ' if(c->pc==0x7fffffffffffull) break; HLE_INTERCEPT(c) switch(c->pc>>12) {')
-        for page in sorted(pages):
-            parts.append(f'case {page}ull: page_{page:x}(c); break;')
-        parts.append('default: boundary("untranslated",c,c->pc); } } guest_run_depth--; }')
     return '\n'.join(parts)
 
 
@@ -441,7 +406,6 @@ def main():
         from . import native_trace as imported
         imported.PAGE_LEAN = True
         imported.PAGE_JUMPS = args.jumps
-        imported.GUEST_CALLS = args.direct_calls and os.environ.get('AC_GUEST_CALLS', '1') != '0'
     if args.optimize:
         # Shared list: native_build and nvn_build key their caches on it.
         from . import native_build

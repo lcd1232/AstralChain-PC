@@ -228,6 +228,9 @@ static const Row controls_rows[] = {
      "расположению кнопок.", "keyboard", true,
      "keyboard|Keyboard and mouse|Клавиатура и мышь;xbox|Xbox / Steam|Xbox / Steam;ps|PlayStation|PlayStation;"
      "switch|Switch|Switch"},
+    {NUMBER, "AC_VIBRATION", "Vibration", "Вибрация",
+     "The controller's vibration strength; 0: off.", "Сила вибрации контроллера; 0 — выключена.", "100", true,
+     "0;200;10; %"},
     {CHECK, "AC_MOUSE_LOOK", "Mouse moves the camera", "Мышь управляет камерой",
      "A click in the window captures the mouse; Alt lets it go while held.",
      "Щелчок по окну захватывает мышь; пока зажат Alt, она свободна.", "1", true},

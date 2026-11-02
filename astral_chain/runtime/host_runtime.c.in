@@ -1454,7 +1454,13 @@ static void reserve(uint64_t base,size_t size,const char *file) {
  /* AC_DATA_DIR relocates the build's code images (portable test bundles). */
  if(file && (n=GetEnvironmentVariableA("AC_DATA_DIR",moved,MAX_PATH)) && n<MAX_PATH) {
   const char *name=strrchr(file,'/');
+#ifdef _WIN32
   if(snprintf(moved+n,MAX_PATH-n,"\\images\\%s",name?name+1:file)>=(int)(MAX_PATH-n)) {fprintf(stderr,"Image path too long\n"); exit(31);}
+#else  /* fopen takes the path as it is: AC_DATA_DIR is a Windows path (Z:\home\..., as the save root must be) */
+  if(snprintf(moved+n,MAX_PATH-n,"/images/%s",name?name+1:file)>=(int)(MAX_PATH-n)) {fprintf(stderr,"Image path too long\n"); exit(31);}
+  for(char *c=moved;*c;c++) if(*c=='\\') *c='/';
+  if(moved[0] && moved[1]==':') memmove(moved,moved+2,strlen(moved+2)+1);
+#endif
   file=moved;
  }
  if(file) { FILE *f=fopen(file,"rb"); if(!f || fread(p,1,size,f)!=size) {fprintf(stderr,"Image read failed\n"); exit(31);} fclose(f); }

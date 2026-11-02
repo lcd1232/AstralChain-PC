@@ -236,9 +236,25 @@ def _local_jumps(cases, page):
     return [(f'L_{int(t[5:t.index("ull")]):x}: ' if int(t[5:t.index('ull')]) in used else '') + t for t in out]
 
 
+# Vector lane writes (`ins v0.s[1], v1.s[0]`, `mov v0.d[1], x8`, `ld1 {v0.h}[3], ...`) come out as a store of one element
+# into the register file in memory: `((sa32 *)&c->v[0])[1] = ...;`. The game builds its vectors that way and then
+# stores or uses the whole register, and a 16-byte read of what narrow stores just wrote cannot be forwarded from them:
+# the CPU waits for the stores to retire (store forwarding stall, ~15 cycles on an Intel Core Ultra; a busy scene's
+# hottest page stalled at one). The write becomes a whole-register update: load, insert (vpinsrd/q/w), store, which
+# also lets consecutive inserts stay in one register. The empty asm stops LLVM folding it back into the narrow store.
+_LANE_WRITE = re.compile(r'\(\(sa(16|32|64) \*\)&c->v\[(\d+)\]\)\[(\d+)\] = ([^;]*);')
+
+
+def _lane_write(m):
+    bits, reg, lane, value = m.group(1), m.group(2), m.group(3), m.group(4)
+    return (f'{{ typedef int{bits}_t _vl __attribute__((vector_size(16), may_alias)); _vl _l = *(_vl *)&c->v[{reg}]; '
+            f'_l[{lane}] = (int{bits}_t)({value}); __asm__("" : "+x"(_l)); *(_vl *)&c->v[{reg}] = _l; }}')
+
+
 def emit_page(page,cases,limit,stop_at=None,external=False,chain=False):
     if PAGE_LEAN and stop_at is None:
         cases=[re.sub(r'trace_call\([^;]*\); ','',text) for text in cases]
+        cases=[_LANE_WRITE.sub(_lane_write,text) for text in cases]
         called=set()
         if DIRECT_PAGES and external:  # (cached builds: page functions are external symbols)
             cases=[_direct_call(text,called) for text in cases]

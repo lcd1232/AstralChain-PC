@@ -571,9 +571,9 @@ def main():
     constants += f'#define PROCESS_CORE_MASK {process["core_mask"]}ull\n#define PROCESS_PRIORITY_MASK {process["priority_mask"]}ull\n'
     constants += f'#define PERFORMANCE_MODE {int(args.performance_mode=="boost")}\n'
     constants += f'#define LEAN_PAGES {int(args.lean)}\n'
-    constants += f'#define APPLICATION_LANGUAGE {control["language_code"] if control else 0}ull\n'
-    system_language=int.from_bytes(args.language.encode('ascii').ljust(8,b'\0'),'little')
-    constants += f'#define SYSTEM_LANGUAGE {system_language}ull\n'
+    # The game's language is chosen when it starts (AC_LANGUAGE, host_runtime.c.in app_languages), from the languages
+    # control.nacp lists: the build no longer depends on it.
+    constants += f'#define NACP_LANGUAGES "{",".join(control["supported_languages"]) if control else ""}"\n'
     runtime_source = f'#define CALL_LIMIT {args.calls}\n'+constants+RUNTIME.replace('/*MEMORY_TABLE*/',memory.c_table())
     runtime_source = '#include <stddef.h>\n'+runtime_constants(romfs)+runtime_source
     setup = '''\nint main(int argc, char **argv) {

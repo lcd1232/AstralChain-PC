@@ -462,8 +462,7 @@ int nvn_host_cpu_count(void) {SYSTEM_INFO info;GetSystemInfo(&info);return (int)
 void *nvn_host_window(void) {
  app_open();
  SetWindowTextW(app_window,L"Astral Chain (native)");
- RECT r={0,0,1600,900};AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
- SetWindowPos(app_window,NULL,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+ app_window_size_apply(app_window);
  {char v[8];DWORD n=GetEnvironmentVariableA("AC_FULLSCREEN",v,sizeof(v));if(n && n<sizeof(v) && atoi(v)) app_set_fullscreen(app_window,1);}
  app_pump();
  return app_window;
@@ -488,6 +487,17 @@ void nvn_present_pace(int interval) {
   uint64_t want=limit>=20 && limit<60 ? 19200000ull/(uint64_t)limit : 320000;
   /* (the slots count in periods: a new period starts the cadence again, else the next slot is seconds away) */
   if(want!=period) {period=want;origin=0;printf("NVN frame limit %d fps\n",limit>=20 && limit<60 ? limit : 60);}
+ }
+ {  /* AC_HANDHELD from the in-game menu (Resolution): the Switch leaves or enters its dock while the game runs; the
+     * game hears it as on the console (applet messages 30 / 31, app_window.h) and changes its resolution itself. */
+  static int handheld;
+  SETTING_LIVE(handheld,"AC_HANDHELD",0);
+  app_modes_load();
+  unsigned operation=handheld==1 ? 0 : 1;
+  if(operation!=app_operation_mode) {
+   app_set_modes(operation,operation ? PERFORMANCE_MODE : 0);
+   printf("[app] %s (AC_HANDHELD=%d)\n",operation ? "docked" : "handheld",handheld);
+  }
  }
  static unsigned presents;
  if(!(++presents%60)) {fflush(stdout);fflush(stderr);} /* long runs end by timeout; keep the log current */

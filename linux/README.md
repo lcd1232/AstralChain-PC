@@ -38,8 +38,11 @@ The install folder holds `game/` (extracted data), `build/` (the program, shader
 
 ## Steam Deck
 
-- **Add to Steam** (with Steam closed) creates a non-Steam shortcut that starts the game directly (`--play`), with
-  artwork. In Game Mode the game then starts from the library like any other; Proton is not used.
+- **Add to Steam** (with Steam closed, the game installed) creates a non-Steam shortcut with artwork that starts the
+  game itself: `play.sh` in the install folder, with the launcher's settings (rewritten whenever they are saved), and
+  glslang copied next to it. The AppImage is not needed to play from Steam and can be removed. In Game Mode the game
+  then starts from the library like any other; Proton is not used. A new launcher version still rebuilds the game:
+  open it and press Play once.
 - On the Deck the launcher defaults to: fullscreen, handheld mode (rendering at 1280x720 instead of 1600x900),
   graphics prepared on a separate thread, BC7 texture compression on the GPU (less memory traffic on the shared
   memory), Vsync (FIFO) and the controller's button icons.

@@ -8,7 +8,10 @@
 | LASRecomp NVN layer, modified | `astral_chain/runtime/las/` | same commit, changes listed in its `README.md` | MIT, `astral_chain/runtime/las/LICENSE-LASRecomp` |
 | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | `third_party/Vulkan-Headers/` (C headers only) | `vulkan-sdk-1.4.363.0` (`6802bb4733b63ed5efd3adb308a6c885ef180ea1`) | Apache-2.0 or MIT, `third_party/Vulkan-Headers/LICENSE.md` |
 | [VulkanMemoryAllocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) | `third_party/VulkanMemoryAllocator/` | 3.1.0 | MIT, `third_party/VulkanMemoryAllocator/LICENSE.txt` |
+| [Dear ImGui](https://github.com/ocornut/imgui) | `third_party/imgui/` (core and `backends/imgui_impl_vulkan`, unmodified; the in-game menu, `astral_chain/runtime/las/menu.cpp`) | 1.91.9, as vendored by LASRecomp (`third_party/imgui/`) | MIT, `third_party/imgui/LICENSE.txt` |
+| [PS5 Button Icons and Controls](https://zacksly.itch.io) by Zacksly | `third_party/ps5-button-icons/` (ten of the white "Buttons Full Solid" 128 px icons, unmodified); reduced to 64 px alpha in `astral_chain/runtime/las/ps5_glyphs.h` (modified) for the PlayStation button prompts | as downloaded 2026-11-01 | CC BY 3.0, `third_party/ps5-button-icons/LICENSE.txt` |
 | [bc7enc](https://github.com/richgel999/bc7enc) | `third_party/bc7enc/` (`bc7enc.c`, `bc7enc.h`; the optional BC7 texture preparation) | commit `f66c2e489b07138f2673a2fb3d27c1aa1d565c48` | MIT or public domain, `third_party/bc7enc/LICENSE` |
+| [Noto Sans CJK](https://github.com/notofonts/noto-cjk) | 13 glyphs of Noto Sans CJK JP Regular (the Japanese, Korean and Chinese language names in the in-game menu), subset and converted to TrueType outlines (modified) in `astral_chain/runtime/las/menu_cjk_font.h` by `make_menu_cjk_font.py` | 2.004 | SIL Open Font License 1.1, `third_party/noto-sans-cjk/LICENSE` |
 | [AstralChain-Dynamic-FPS](https://github.com/yogesh1239/AstralChain-Dynamic-FPS) | `third_party/AstralChain-Dynamic-FPS/1.0.1.pchtxt` (`mods/Dynamic-60fps/exefs/1.0.1.pchtxt`) | v1.1.1, commit `79965b4df077f64b27b74456d0db88c6afac5bbe` | MIT, `third_party/AstralChain-Dynamic-FPS/LICENSE` |
 
 ### AMD FidelityFX Super Resolution 1
@@ -48,3 +51,15 @@ build time by `astral_chain/shader_build.py`. The vendored file itself is unchan
 
 [Capstone](https://www.capstone-engine.org/) (BSD-3-Clause), [python-lz4](https://github.com/python-lz4/python-lz4)
 (BSD-3-Clause).
+
+## Linux build
+
+| Component | Where | License |
+| --- | --- | --- |
+| [TotK Recomp](https://github.com/valentderah/totk-pc-recomp) write-watch code (userfaultfd + `PAGEMAP_SCAN`), adapted | `astral_chain/runtime/posix/w32_memory.c` | MIT |
+
+Carried in the Linux AppImage (not in this repository): [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+CPython 3.14 with Tcl/Tk (PSF License, Tcl/Tk license), Zig 0.17.0 (MIT), glslang 16.6.0 (BSD-3-Clause and others),
+NSTool 1.9.2 (MIT), [SDL3](https://libsdl.org) 3.4 from the Steam Runtime 3 "sniper" SDK (zlib; `tools/linux-sdk/licenses`),
+the Khronos Vulkan loader from the same SDK (Apache-2.0; link input only), Capstone and python-lz4 (BSD-3-Clause).
+

@@ -2,7 +2,9 @@
 // Astral Chain: presents into the runtime's Win32 window (nvn_host_window) instead of an SDL window; the
 // Link's Awakening widescreen, menu, output-scale and test hooks are removed (see runtime/las/README.md).
 #include <windows.h>
+#ifndef WIN32_POSIX
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -15,10 +17,11 @@
 
 #include "../../settings.h"
 #include "vk.h"
+#include "../../menu.h"
 #include "../renderer.h"
 
 VkG g_vk;
-Settings g_settings;  // all off: no SMAA, bilinear presentation, windowed
+Settings g_settings;  // no SMAA, windowed; the upscaler from the in-game menu (present_settings)
 void *nvn_host_window(void);  // runtime nvn_hle.h: the application window (HWND)
 static HWND window;
 static VkDebugUtilsMessengerEXT messenger;
@@ -42,8 +45,16 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     const char *ext[16];
     uint32_t n_ext = 0;
+#ifdef WIN32_POSIX
+    // Linux: the surface extensions of the SDL window system in use (Wayland or X11)
+    uint32_t n_sdl = 0;
+    const char *const *sdl_ext = win32_posix_vulkan_instance_extensions(&n_sdl);
+    for (uint32_t i = 0; i < n_sdl && n_ext < 12; i++) ext[n_ext++] = sdl_ext[i];
+    if (!n_sdl) ext[n_ext++] = VK_KHR_SURFACE_EXTENSION_NAME;
+#else
     ext[n_ext++] = VK_KHR_SURFACE_EXTENSION_NAME;
     ext[n_ext++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#endif
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -442,7 +453,12 @@ bool vk_frame_begin(const float clear[4]) {
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
-    vk_wait_seq(slot_seq[slot]);
+    // AC_FRAMES_IN_FLIGHT=<1..3>: how many presented frames the GPU may still be working on when the next one starts
+    // (default 3: the acquire semaphores' rotation). (test: the Steam Deck's flashes of the UI atlas over the picture)
+    static int in_flight = -1;
+    if (in_flight < 0) { const char *e = getenv("AC_FRAMES_IN_FLIGHT"); in_flight = e ? atoi(e) : FRAMES;
+                         if (in_flight < 1 || in_flight > FRAMES) in_flight = FRAMES; }
+    vk_wait_seq(slot_seq[(slot + FRAMES - in_flight) % FRAMES]);
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
@@ -630,6 +646,33 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+// The in-game menu's Screen tab, read again after each change (game_settings.h): AC_UPSCALER = fsr (default: AMD FSR 1,
+// EASU + RCAS, when the picture's place in the window is larger than the game image) | bilinear; AC_FSR_SHARPNESS =
+// 0..100 (default 75; 0: no sharpening; RCAS at (100 - it) / 50 stops, as the TotK PC port); AC_ASPECT = fit (default:
+// the game's 16:9 with black bars) | stretch (the whole window).
+int setting_get(const char *name, char *buf, unsigned size);
+int setting_int(const char *name, int otherwise);
+unsigned settings_version(void);
+static bool g_stretch;
+float g_fsr_sharpness = 75;  // (exec.c post_process)
+static float g_render_scale = 1.0f;
+static void present_settings(void) {
+    static unsigned version = ~0u;
+    if (version == settings_version()) return;
+    version = settings_version();
+    char v[32];
+    g_settings.upscaler = setting_get("AC_UPSCALER", v, sizeof v) && !strcmp(v, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_FSR1;
+    int sharp = setting_int("AC_FSR_SHARPNESS", 75);
+    g_fsr_sharpness = (float)(sharp < 0 ? 0 : sharp > 100 ? 100 : sharp);
+    g_stretch = setting_get("AC_ASPECT", v, sizeof v) && !strcmp(v, "stretch");
+    // AC_RENDER_SCALE: the game's 16:9 targets (1600x900 and their halves, quarters...) are made this many times
+    // larger (textures.c tex_scalable); the game draws to them as if they were its own size
+    double rs = setting_get("AC_RENDER_SCALE", v, sizeof v) ? atof(v) : 1.0;
+    g_render_scale = rs >= 0.5 && rs <= 4.0 ? (float)rs : 1.0f;
+    LOG("[present] %s, sharpness %d, %s, render scale %.2f\n", g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear",
+        (int)g_fsr_sharpness, g_stretch ? "stretch" : "fit", g_render_scale);
+}
+
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
@@ -645,7 +688,8 @@ void backend_present(NvnTexture *t) {
     }
     if (have) {
         // Astral Chain: the game image fills the window at its own aspect ratio (letterboxed), rendered at the
-        // game's resolution (render scale 1). No widescreen crop, overlay menu or dynamic resolution.
+        // game's resolution times the render scale (AC_RENDER_SCALE). No widescreen crop, overlay menu or dynamic
+        // resolution.
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height, gw = t->width ? t->width : dw, gh = t->height ? t->height : dh;
         float uv[4] = {0, 0, 1, 1};
         const int *cr = g_present_crop;
@@ -656,11 +700,17 @@ void backend_present(NvnTexture *t) {
             gw = cr[2]; gh = cr[3];
         }
         memcpy(g_shot_crop, uv, sizeof uv);
+        present_settings();
         double k = dw / gw < dh / gh ? dw / gw : dh / gh, vw = gw * k, vh = gh * k, vx = (dw - vw) / 2, vy = (dh - vh) / 2;
-        renderer_set_scale(1.0f, 1.0f);
+        if (g_stretch) vw = dw, vh = dh, vx = vy = 0;
+        renderer_set_scale(g_render_scale, g_render_scale);
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, uv[0], uv[1], uv[2], uv[3]};
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        // the in-game menu over the picture (menu.cpp; still inside the window image's rendering)
+        MenuTarget mt = {g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam, g_vk.queue, g_vk.sc_format,
+                         g_vk.sc_extent.width, g_vk.sc_extent.height, g_vk.sc_count};
+        if (menu_overlay_frame(&mt)) menu_overlay_draw(vk_cmd());
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
@@ -808,15 +858,25 @@ static void exit_handler(void) {
     fflush(stderr);
 }
 
+static void create_surface(void) {
+#ifdef WIN32_POSIX
+    uint64_t surface = 0;
+    if (!win32_posix_vulkan_surface(window, g_vk.inst, &surface)) FATAL("no Vulkan surface for the window\n");
+    g_vk.surface = (VkSurfaceKHR)surface;
+#else
+    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
+    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+#endif
+}
+
 static void window_init(void) {
     if (window) return;
     window = (HWND)nvn_host_window();
     if (!window) FATAL("no host window for Vulkan presentation\n");
     atexit(exit_handler);
     create_instance();
-    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
-    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+    create_surface();
     pick_device();
     create_device();
     create_swapchain();
@@ -850,9 +910,7 @@ void vk_init_for_warm(void) {
     window = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 16, 16, NULL, NULL, wc.hInstance, NULL);
     if (!window) FATAL("no window for the GPU warm-up\n");
     create_instance();
-    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
-    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+    create_surface();
     pick_device();
     create_device();
     vk_exec_init();

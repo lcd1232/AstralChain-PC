@@ -4,9 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#ifdef __linux__
+#include <errno.h>
+#include <time.h>
+#endif
 #include "cpu.h"
 #include "simd.h"
 #include "ipc.h"
+#include <string.h>
+#include "game_settings.h"
 /* Per-call log lines (SVC, IPC, audio and HID traffic): ~300 MB an hour of play. Off in lean (play) builds unless
  * AC_TRACE_CALLS is set; AC_QUIET=1 turns them off in the others. */
 #ifndef LEAN_PAGES
@@ -25,12 +31,52 @@ static int hot_log_on(void) {
 #ifndef SYSCALL_LIMIT
 #define SYSCALL_LIMIT 100000u
 #endif
-#ifndef APPLICATION_LANGUAGE
-#define APPLICATION_LANGUAGE 0ull
+#ifndef NACP_LANGUAGES
+#define NACP_LANGUAGES ""
 #endif
-#ifndef SYSTEM_LANGUAGE
-#define SYSTEM_LANGUAGE 0ull
-#endif
+/* The game's language (the in-game menu's Game language, AC_LANGUAGE: a code of control_meta.LANGUAGES, or auto: the
+ * host's locale, $LC_ALL / $LC_MESSAGES / $LANG), read once, at the game's first question: the Switch system language
+ * the game is told (settings GetLanguageCode), and the application language (applet GetDesiredLanguage): that one if
+ * the game has it, else US English, else its first (control.nacp, NACP_LANGUAGES). A change applies at the next start;
+ * nothing is rebuilt. */
+static uint64_t app_system_language,app_application_language;
+static char app_language_code[16];
+static int app_language_in(const char *code,const char *list) {
+ size_t n=strlen(code);
+ for(const char *p=list;*p;) {
+  const char *e=strchr(p,',');size_t len=e ? (size_t)(e-p) : strlen(p);
+  if(len==n && !strncmp(p,code,n)) return 1;
+  p+=len;if(*p) p++;
+ }
+ return 0;
+}
+static uint64_t app_language_pack(const char *code) {uint64_t v=0;memcpy(&v,code,strlen(code)<8 ? strlen(code) : 8);return v;}
+static const char *const app_known_languages="en-US,en-GB,ja,fr,de,es-419,es,it,nl,fr-CA,pt,ru,ko,zh-Hant,zh-Hans,pt-BR";
+static void app_language_auto(char *out,size_t size) {
+ const char *names[]={"LC_ALL","LC_MESSAGES","LANG"};const char *loc=NULL;
+ for(int i=0;i<3 && !loc;i++) {const char *v=getenv(names[i]);if(v && *v && strcmp(v,"C") && strcmp(v,"POSIX")) loc=v;}
+ char l[32]="";if(loc) snprintf(l,sizeof l,"%s",loc);
+ for(char *p=l;*p;p++) {if(*p=='-') *p='_';if(*p>='A' && *p<='Z') *p+=32;if(*p=='.' || *p=='@' || *p==':') {*p=0;break;}}
+ if(!strncmp(l,"zh",2)) {snprintf(out,size,"%s",strstr(l,"tw") || strstr(l,"hk") || strstr(l,"mo") || strstr(l,"hant") ? "zh-Hant" : "zh-Hans");return;}
+ static const char *const two[]={"en-US","ja","fr","de","es","it","ru","ko","nl","pt"};
+ for(unsigned i=0;i<sizeof two/sizeof *two;i++) if(l[0] && !strncmp(l,two[i],2)) {snprintf(out,size,"%s",two[i]);return;}
+ snprintf(out,size,"en-US");
+}
+static void app_languages_load(void) {
+ if(app_system_language) return;
+ char v[16]="";
+ if(!setting_get("AC_LANGUAGE",v,sizeof v) || !v[0] || !strcmp(v,"auto") || !app_language_in(v,app_known_languages))
+  app_language_auto(v,sizeof v);
+ snprintf(app_language_code,sizeof app_language_code,"%s",v);
+ const char *app=app_language_in(v,NACP_LANGUAGES) ? v : app_language_in("en-US",NACP_LANGUAGES) ? "en-US" : NULL;
+ char first[16]="";
+ if(!app && NACP_LANGUAGES[0]) {size_t n=strcspn(NACP_LANGUAGES,",");snprintf(first,sizeof first,"%.*s",(int)n,NACP_LANGUAGES);app=first;}
+ app_system_language=app_language_pack(v);
+ app_application_language=app ? app_language_pack(app) : 0;
+ printf("[app] language %s (the game's text: %s)\n",v,app ? app : "?");fflush(stdout);
+}
+/* (las/menu.cpp: the menu's language follows the game's) */
+const char *host_game_language(void) {app_languages_load();return app_language_code;}
 static __thread unsigned calls;  /* per host thread: shared counters bounced between cores in parallel mode */
 static unsigned syscalls;
 static __thread struct { uint64_t from,target; } recent_calls[64];
@@ -46,6 +92,7 @@ static volatile DWORD klock_owner;
 static unsigned klock_depth;
 static uint64_t klock_contended,klock_contended_qpc;  /* (updated under the lock) */
 static uint64_t nvn_contended,nvn_contended_qpc;  /* (nvn_hle.h nvn_lock; parallel stats) */
+static void nvn_main_report(double qpc_hz);  /* (nvn_hle.h: the main thread's slowest NVN calls; parallel stats) */
 static uint64_t nvn_thread_qpc[33],nvn_thread_calls[33];  /* host time in NVN calls per guest thread (parallel stats) */
 /* (stall reports) the guest thread holding the lock for a supervisor call, and the call; the sound thread */
 static volatile unsigned klock_holder=99,klock_holder_svc;
@@ -399,6 +446,7 @@ static void close_library_applet(void) {
 #include "hid_service.h"
 #include "time_service.h"
 #include "app_window.h"
+#include "cpu_placement.h"
 #include "guest_threads.h"
 #include "controller_applet.h"
 #include "swkbd_applet.h"
@@ -456,7 +504,41 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc);
 static unsigned test_stall_ms;  /* (AC_CUTSCENE_STALL) slept after the kernel lock is released */
 /* Parallel mode: supervisor calls run under the kernel lock; any state change may wake other guest threads; a call
  * that leaves this thread waiting blocks its host thread (lock released while asleep); an exited thread ends. */
+/* svc #0xB3 (movie-sync-1.0.1.pchtxt): a movie's frame clock ran this frame (the replaced mov x19, x0 is done here);
+ * nvn_present_pace presents at 30 FPS while that happens. No kernel state: no lock. */
+unsigned movie_present_mark;
+/* Entry labels (native_trace.py): an entry the analysis missed runs in its page's unoptimized fallback function.
+ * AC_FALLBACK_LOG=1: the most frequent such addresses every 5 s (to add them as entries). */
+#define FALLBACK_SLOTS 4096
+static struct {uint64_t pc,count;} fallback_seen[FALLBACK_SLOTS];
+static uint64_t fallback_total,fallback_printed;
+void rt_fallback_note(uint64_t pc) {
+ static int on=-1;
+ if(on<0) on=GetEnvironmentVariableA("AC_FALLBACK_LOG",NULL,0)!=0;
+ __atomic_fetch_add(&fallback_total,1,__ATOMIC_RELAXED);
+ if(!on) return;
+ unsigned h=(unsigned)((pc>>2)*2654435761u)%FALLBACK_SLOTS;
+ for(unsigned i=0;i<16;i++,h=(h+1)%FALLBACK_SLOTS) {
+  if(fallback_seen[h].pc==pc) {__atomic_fetch_add(&fallback_seen[h].count,1,__ATOMIC_RELAXED);break;}
+  uint64_t zero=0;
+  if(!fallback_seen[h].pc && __atomic_compare_exchange_n(&fallback_seen[h].pc,&zero,pc,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {fallback_seen[h].count=1;break;}
+ }
+ uint64_t now=GetTickCount64();
+ if(now-fallback_printed<5000) return;
+ fallback_printed=now;
+ printf("FALLBACK %llu entries; top:",(unsigned long long)fallback_total);
+ for(int k=0;k<15;k++) {
+  unsigned best=0;uint64_t most=0;
+  for(unsigned i=0;i<FALLBACK_SLOTS;i++) if(fallback_seen[i].count>most) {most=fallback_seen[i].count;best=i;}
+  if(!most) break;
+  printf(" 0x%llx:%llu",(unsigned long long)fallback_seen[best].pc,(unsigned long long)most);
+  fallback_seen[best].count=0;
+ }
+ printf("\n");
+ for(unsigned i=0;i<FALLBACK_SLOTS;i++) fallback_seen[i].count=0;
+}
 void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
+ if(imm==0xB3) {extern unsigned nvn_present_count;c->x[19]=c->x[0];movie_present_mark=nvn_present_count;return;}
  if(!parallel_mode) {rt_svc_body(c,imm,pc);return;}
  if(imm==0xb) {
   /* SleepThread / yield: nothing else can end it early, so no kernel state is involved (the most frequent call:
@@ -464,6 +546,17 @@ void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
   int64_t ns=(int64_t)c->x[0];
   if(ns<-2) boundary("thread-yield-mode",c,pc);
   if(ns<=0) SwitchToThread();
+#ifdef __linux__
+  else {
+   /* The kernel's sleep is precise to tens of microseconds here (Windows' Sleep is not: below, its last 2 ms spin,
+    * and threads that sleep a millisecond in a loop kept whole cores busy in sched_yield). Same clock as
+    * QueryPerformanceCounter (CLOCK_MONOTONIC). */
+   struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);
+   uint64_t t=(uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec+(uint64_t)ns;
+   ts.tv_sec=(time_t)(t/1000000000u);ts.tv_nsec=(long)(t%1000000000u);
+   while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,NULL)==EINTR) {}
+  }
+#else
   else {
    uint64_t until=rt_ticks()+(uint64_t)(((__uint128_t)(uint64_t)ns*19200000+999999999)/1000000000);
    for(uint64_t now=rt_ticks();now<until;now=rt_ticks()) {
@@ -471,6 +564,7 @@ void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
     if(left_ms>=2) Sleep((DWORD)(left_ms-1)); else SwitchToThread();
    }
   }
+#endif
   c->x[0]=0;return;
  }
  klock();threads_initialize();
@@ -498,13 +592,14 @@ void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
  * 1 gameplay, 0 cutscene with the measured step at 60 FPS (default), 2 cutscene as in the unmodified game
  * (AC_CUTSCENE_FPS=30): the original fixed-step path at 30 FPS (nvn_present_pace, nvn_hle.h). */
 int cutscene_mode;  /* (presented at 30 FPS) */
+static double cut_lag_base;static int cut_lag_ok;  /* (svc #0xB1: how far the cutscene picture is behind its sound) */
 static unsigned cut_ends;static double cut_carried;  /* (svc #0xB2, reported at a cutscene's end) */
 static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
  if(imm==0xB1) {
-  static int at30=-1;
+  static int at30;
   static float debt;  /* real time the cutscene picture is behind, in 30 FPS frames */
   static int was;
-  if(at30<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_CUTSCENE_FPS",v,sizeof(v));at30=n && n<sizeof(v) && atoi(v)==30;}
+  {static int fps;SETTING_LIVE(fps,"AC_CUTSCENE_FPS",0);at30=fps==30;}
   int cutscene=!(c->x[21]&1);
   cutscene_mode=cutscene && at30;
   /* Cutscene A/V sync, measured on the cutscene after the highway chase (screenshots and recorded sound against a run
@@ -533,6 +628,53 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    float m;uint32_t b=(uint32_t)c->v[8];memcpy(&m,&b,4);
    if(m>6.0f && m<9000.0f) printf("CUTSCENE long frame of %.0f ms at %.3f s\n",m*1000.0f/30.0f,(double)rt_ticks()/19200000.0);
   }
+  {/* Cutscene clocks, from the cutscene's second frame (the first one's step is the loading screen's): the picture's
+    * (the steps the game stored, +0xD0, in 30 FPS frames) and its sound's (real time, less the time the sound queue ran
+    * dry, plus the sound skipped to catch up: the sound the player has heard). lag: how far the picture is behind.
+    *
+    * For cutscenes the engine draws (pre-rendered movies keep their own clock: movie-sync-1.0.1.pchtxt). At 60 FPS
+    * the step (s0, in 30 FPS frames) is clamped to 8 after this call (cutscene-catchup patch): a frame longer than
+    * 267 ms lost its time past that while the sound played on. When the picture is more than a frame behind its sound,
+    * the step is raised toward the sound, still at most 8, until it has caught up; the 30 FPS path below adds whole
+    * frames the same way. A pause of both (a loading screen, a dry sound queue) leaves nothing to catch up.
+    * AC_CUTSCENE_REPAY=0: off. AC_AVSYNC_LOG=1: the lag every 2 s; 2: also each frame's time (AVF lines), to match
+    * against AC_AUDIO_DUMP. */
+   static int log=-1,repay=-1,active,behind;static double picture,ref,next,caught;
+   cut_lag_ok=0;
+   if(log<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_AVSYNC_LOG",v,sizeof(v));log=n && n<sizeof(v) ? (v[0]=='1' ? 1 : v[0]=='2' ? 2 : 0) : 0;}
+   if(repay<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_CUTSCENE_REPAY",v,sizeof(v));repay=!(n && n<sizeof(v) && v[0]=='0');}
+   LARGE_INTEGER f,q;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&q);
+   double now=(double)q.QuadPart/(double)f.QuadPart,audio=now-wave_content_lag;
+   if(!cutscene) {
+    if(active && log) printf("AVSYNC end: picture %.3f s, offset %+.0f ms\n",picture,(picture-audio-ref)*1000.0);
+    active=0;
+   } else if(!active) {
+    active=1;picture=0;ref=1e300;next=now+2.0;behind=0;
+    /* 60 FPS: the cutscene's first frame steps one 30 FPS frame at most, as the 30 FPS path counts it (its measured
+     * time is the loading screen's before it, up to 267 ms after the clamp). */
+    if(!at30 && repay) {float s0;uint32_t b0=(uint32_t)c->v[0];memcpy(&s0,&b0,4);
+     if(s0>1.0f) {s0=1.0f;memcpy(&b0,&s0,4);c->v[0]=b0;}}
+   }
+   else {
+    float stored;memcpy(&stored,(void*)(uintptr_t)(c->x[19]+0xD0),4);
+    if(ref==1e300) ref=-audio;
+    else {
+     picture+=stored/30.0;
+     cut_lag_base=(audio+ref)-picture;cut_lag_ok=repay;  /* (for the 30 FPS path below) */
+     if(!at30 && repay) {
+      float s0;uint32_t b0=(uint32_t)c->v[0];memcpy(&s0,&b0,4);
+      double lag=(audio+ref)-picture-s0/30.0;  /* (after this frame's own step) */
+      if(lag>1.0/30.0 && s0<8.0f) {
+       float pay=(float)(lag*30.0);if(pay>8.0f-s0) pay=8.0f-s0;
+       if(!behind) {behind=1;caught=0;printf("CUTSCENE picture %.0f ms behind its sound at %.3f s: catching up\n",lag*1000.0,now);}
+       s0+=pay;caught+=pay;memcpy(&b0,&s0,4);c->v[0]=b0;
+      } else if(behind && lag<=1.0/30.0) {behind=0;printf("CUTSCENE caught up %.0f ms at %.3f s\n",caught*1000.0/30.0,now);}
+     }
+    }
+    if(log && now>=next) {next+=2.0;printf("AVSYNC t=%.1f s: offset %+.0f ms\n",picture,(picture-audio-ref)*1000.0);}
+    if(log==2) printf("AVF %.4f %.4f\n",now,picture);  /* (every frame: QPC seconds, picture seconds; with AC_AUDIO_DUMP) */
+   }
+  }
   if(!cutscene_mode) {debt=0;was=0;return;}
   /* The original's fixed step of 1.0 per frame; whole extra frames once the picture is a frame or more behind real
    * time (a stall), up to 7. Late and early frames of the 30 FPS cadence cancel out. The first cutscene frame's time
@@ -543,6 +685,14 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
   was=1;
   debt+=measured-1.0f;
   float step=1.0f;
+  if(cut_lag_ok) {
+   /* Against the sound's clock (above), as at 60 FPS: whole extra frames for the time the picture is behind the
+    * sound after this frame, up to 7. A stall over a second while the sound played on (not counted below) is caught
+    * up too; a pause of both leaves nothing to catch up. */
+   double lag=cut_lag_base-1.0/30.0;
+   if(lag>=1.0/30.0) {float extra=floorf((float)(lag*30.0));if(extra>7.0f) extra=7.0f;step+=extra;}
+   debt=0;
+  } else
   if(debt>=1.0f) {float extra=floorf(debt);if(extra>7.0f) extra=7.0f;step+=extra;debt-=extra;}
   if(debt<-2.0f) debt=-2.0f;
   memcpy(&bits,&step,4);c->v[8]=bits;
@@ -943,9 +1093,8 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    unsigned handle=ipc_u32(request.arguments),index=hid_sensor_index(handle);
    if(request.command==66) hid_sensor_started[index/64]|=1ull<<(index%64);
    else hid_sensor_started[index/64]&=~(1ull<<(index%64));
-   /* Starting a subscription does not attach a sensor. Keyboard has none;
-    * its six-axis rings remain empty with no connected attributes. */
-   printf("HID sixaxis handle=0x%x started=%u (no host sensor)\n",handle,request.command==66);
+   /* The FullKey ring is filled every sample (hid_service.h hid_motion): the pad's gyro, else at rest. */
+   printf("HID sixaxis handle=0x%x started=%u\n",handle,request.command==66);
    reply_result(buffer,&request,0);c->x[0]=0;return;
   }
   if(kind==SESSION_VIBRATION_LIST && request.command==0 && request.argument_size>=4) {
@@ -1060,8 +1209,9 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    application_ensure_save(buffer,&request);c->x[0]=0;return;
   }
   if(kind==SESSION_APPLICATION_FUNCTIONS && request.command==21) {
-   if(!APPLICATION_LANGUAGE) boundary("missing-application-language-metadata",c,pc);
-   reply_wide_value(buffer,&request,APPLICATION_LANGUAGE);c->x[0]=0;return;
+   app_languages_load();
+   if(!app_application_language) boundary("missing-application-language-metadata",c,pc);
+   reply_wide_value(buffer,&request,app_application_language);c->x[0]=0;return;
   }
   if(kind==SESSION_APPLICATION_FUNCTIONS && request.command==22 && request.argument_size>=4) {
    application_terminate_result=ipc_u32(request.arguments);application_terminate_result_set=1;
@@ -1171,8 +1321,9 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    puts("");reply_result(buffer,&request,0);c->x[0]=0;return;
   }
   if(kind==SESSION_SETTINGS && request.command==0) {
-   if(!SYSTEM_LANGUAGE) boundary("missing-system-language",c,pc);
-   reply_wide_value(buffer,&request,SYSTEM_LANGUAGE);c->x[0]=0;return;
+   app_languages_load();
+   if(!app_system_language) boundary("missing-system-language",c,pc);
+   reply_wide_value(buffer,&request,app_system_language);c->x[0]=0;return;
   }
   if(kind==SESSION_SETTINGS && (request.command==5 || request.command==6)) {
    /* System locale identifiers, independent of this game's supported languages. */
@@ -1376,7 +1527,13 @@ static void reserve(uint64_t base,size_t size,const char *file) {
  /* AC_DATA_DIR relocates the build's code images (portable test bundles). */
  if(file && (n=GetEnvironmentVariableA("AC_DATA_DIR",moved,MAX_PATH)) && n<MAX_PATH) {
   const char *name=strrchr(file,'/');
+#ifdef _WIN32
   if(snprintf(moved+n,MAX_PATH-n,"\\images\\%s",name?name+1:file)>=(int)(MAX_PATH-n)) {fprintf(stderr,"Image path too long\n"); exit(31);}
+#else  /* fopen takes the path as it is: AC_DATA_DIR is a Windows path (Z:\home\..., as the save root must be) */
+  if(snprintf(moved+n,MAX_PATH-n,"/images/%s",name?name+1:file)>=(int)(MAX_PATH-n)) {fprintf(stderr,"Image path too long\n"); exit(31);}
+  for(char *c=moved;*c;c++) if(*c=='\\') *c='/';
+  if(moved[0] && moved[1]==':') memmove(moved,moved+2,strlen(moved+2)+1);
+#endif
   file=moved;
  }
  if(file) { FILE *f=fopen(file,"rb"); if(!f || fread(p,1,size,f)!=size) {fprintf(stderr,"Image read failed\n"); exit(31);} fclose(f); }

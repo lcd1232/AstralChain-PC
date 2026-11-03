@@ -20,6 +20,7 @@ import sys
 import time
 
 from . import shader_cache
+from . import host
 
 PROJECT = Path(__file__).resolve().parent.parent
 RUNTIME = PROJECT/'astral_chain'/'runtime'
@@ -44,11 +45,12 @@ def tool_digest() -> str:
 
 def build_tool(zig: Path, build: Path) -> Path:
     out = build/'bc7-convert'/tool_digest()
-    dll = out/'bc7_convert.dll'
+    dll = out/('bc7_convert.so' if host.LINUX else 'bc7_convert.dll')
     if dll.is_file():
         return dll
     out.mkdir(parents=True, exist_ok=True)
-    subprocess.run([str(zig), 'cc', '-target', 'x86_64-windows-gnu', '-O2', '-shared', '-I', str(RUNTIME),
+    target = [*host.target(), '-fPIC'] if host.LINUX else ['-target', 'x86_64-windows-gnu']
+    subprocess.run([str(zig), 'cc', *target, '-O2', '-shared', '-I', str(RUNTIME),
                     '-I', str(RUNTIME/'las'), '-I', str(BC7ENC), *map(str, SOURCES), '-o', str(dll)], check=True)
     return dll
 

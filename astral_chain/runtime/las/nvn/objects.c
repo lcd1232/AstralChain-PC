@@ -9,6 +9,7 @@
 void renderer_sync(void);
 uint64_t renderer_wait_target(uint64_t seq);
 uint64_t renderer_fence_seq(void);
+uint64_t renderer_fence_submit(void);
 int renderer_seq_done(uint64_t seq);
 
 static uint64_t next_debug_id = 1;
@@ -134,15 +135,17 @@ static pthread_mutex_t aq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t aq_more = PTHREAD_COND_INITIALIZER, aq_less = PTHREAD_COND_INITIALIZER;
 uint64_t nvn_async_drains, nvn_async_waits;  // (stats)
 
+void cpu_place_register(unsigned slot, const char *name);  // (runtime/cpu_placement.h: performance cores on hybrid CPUs)
 static void *aq_worker(void *arg) {
     (void)arg;
+    cpu_place_register(0, "render worker");
     for (;;) {
         pthread_mutex_lock(&aq_lock);
         while (aq_head == aq_tail) pthread_cond_wait(&aq_more, &aq_lock);
         AsyncJob j = aq[aq_head % AQ_SIZE];
         pthread_mutex_unlock(&aq_lock);
         if (j.kind == AJ_EXEC) backend_execute(j.handle);
-        else if (j.kind == AJ_FENCE) j.sync->seq = renderer_fence_seq();
+        else if (j.kind == AJ_FENCE) j.sync->seq = renderer_fence_submit();
         else { backend_present_crop(j.crop); backend_present(j.tex); }
         pthread_mutex_lock(&aq_lock);
         aq_head++;
@@ -154,8 +157,10 @@ static void *aq_worker(void *arg) {
 }
 static bool aq_enabled(void) {
     if (aq_on < 0) {
+        // (on unless AC_ASYNC_SUBMIT=0: in a busy scene on an Intel Arc B390 laptop, ~900 draws a frame, 30-40 fps
+        //  without the worker and 56-61 with it, 2026-11-02; the render thread spent ~30% of its time translating)
         const char *e = getenv("AC_ASYNC_SUBMIT");
-        aq_on = e && atoi(e) != 0;
+        aq_on = !e || atoi(e) != 0;
         if (aq_on) {
             pthread_t t;
             if (pthread_create(&t, NULL, aq_worker, NULL)) { LOG("[nvn] async submission: no worker thread\n"); aq_on = 0; }
@@ -166,7 +171,14 @@ static bool aq_enabled(void) {
 }
 static uint64_t aq_push(AsyncJob j) {  // the job's number (done when aq_head reaches it)
     pthread_mutex_lock(&aq_lock);
-    while (aq_tail - aq_head == AQ_SIZE || (j.kind == AJ_PRESENT && aq_presents >= 1)) pthread_cond_wait(&aq_less, &aq_lock);
+    // AC_ASYNC_PRESENT_DRAIN=1: a present also waits until the worker has run everything queued before it. It was the
+    // default against the title movie's flashes of old pictures, which turned out to come from movies running at 60 FPS
+    // (now at 30: nvn_hle.h); in a busy scene on an Intel Arc B390 laptop (~2000 draws a frame) the drain made the
+    // worker a loss: 31.4 fps against 35.0 without the worker and 37.7 with it and no drain (2026-11-02).
+    static int drain = -1;
+    if (drain < 0) { const char *e = getenv("AC_ASYNC_PRESENT_DRAIN"); drain = e && atoi(e) != 0; }
+    while (aq_tail - aq_head == AQ_SIZE || (j.kind == AJ_PRESENT && (aq_presents >= 1 || (drain && aq_tail != aq_head))))
+        pthread_cond_wait(&aq_less, &aq_lock);
     aq[aq_tail % AQ_SIZE] = j;
     uint64_t id = ++aq_tail;
     if (j.kind == AJ_PRESENT) aq_presents++;
@@ -241,7 +253,7 @@ NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
     s->signaled = 1;
     if (aq_on > 0) { s->async_job = aq_push((AsyncJob){.kind = AJ_FENCE, .sync = s}); return; }
-    s->seq = renderer_fence_seq();
+    s->seq = renderer_fence_submit();
 }
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
 NVN(nvnQueueWaitSync) { RET(1); }

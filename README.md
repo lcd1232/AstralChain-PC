@@ -19,6 +19,11 @@ shaders, keys or firmware, and never will. Everything the setup produces comes f
 > **AI disclosure.** Most of the code, tooling, reverse engineering and documentation here was written by Claude
 > (Anthropic) through Claude Code, directed and tested by the repository owner. It is shared as-is as a fan project.
 
+## Linux and Steam Deck
+
+A native Linux build (no Proton or Wine) with a setup and launcher AppImage, Steam Deck defaults and an **Add to
+Steam** button: see [linux/README.md](linux/README.md).
+
 ## Status
 
 | | |
@@ -42,7 +47,8 @@ Fixes marked *not yet confirmed* were tested in scripted runs, but not yet confi
   right click calls the Legion (ZL), the wheel changes weapons. Hold Alt to get the cursor back. Sensitivity and
   invert in **Settings > Mouse and keyboard**.
 - **Keyboard and mouse button icons in the game.** The button prompts show the keys and mouse buttons you set instead
-  of the Switch buttons (**Settings > Mouse and keyboard > Button icons** to keep the Switch ones).
+  of the Switch buttons (**Settings > Mouse and keyboard > Button icons**: Xbox, PlayStation or the Switch ones for a
+  controller).
 - **Controls**: two bindings per action (main and alternative), mouse buttons and wheel included. New defaults:
   Shift sprints, Space dodges, Tab is IRIS, Esc the pause menu (the old keys stay as alternatives). Keys you had
   changed in Controls stay on their actions; a new default that would clash with one of them is left empty.
@@ -191,10 +197,18 @@ steers your Legion while ZL is held). Hold **Alt**, or switch to another window,
 to resume. Sensitivity and invert are in **Settings > Mouse and keyboard**.
 
 **Button icons.** The game's button prompts show your keys and mouse buttons instead of the Switch buttons (the main
-binding of each action). **Settings > Mouse and keyboard > Button icons** brings back the Switch icons for playing with
-a controller.
+binding of each action). For playing with a controller, **Settings > Mouse and keyboard > Button icons** switches them
+to Xbox (also for the Steam Controller), PlayStation or the original Switch icons. The Xbox and PlayStation icons follow
+the button positions: the Switch's A (right) shows as Xbox B / PlayStation circle, its B (bottom) as Xbox A / cross.
 
 F11 or Alt+Enter: fullscreen on or off (F11 and Alt stay game keys if you assign them in **Controls**).
+
+**In-game menu.** F1, or Minus and Plus held together on a controller (Back and Start, View and Menu), opens the
+settings over the running game; the same, Esc or B close it. Its tabs (Screen, Game, Sound, Controls, Advanced; L and
+R or Q and E switch them) hold the game's settings: frame rate limit, fullscreen, button icons, mouse camera, cutscene
+frame rate, save backups, sound resync and the restart-only graphics switches, marked "after restart". They are kept in
+`settings.ini` in the install folder. The Linux launcher moved its game settings there on the first start and shows
+only its own (languages, shader preparation); a setting the Windows launcher passes is shown fixed in the menu.
 
 ### Texture compression (BC7)
 
@@ -267,7 +281,7 @@ happens, then attach the zip that **Create report** makes. Otherwise include `bu
 | `setup.cmd`, `Play Astral Chain.cmd` | The same steps from a console window |
 | `astral_chain/` | Translator driver, build system and Windows runtime (C) |
 | `astral_chain/patches/` | Code patches of this project (pchtxt) |
-| `third_party/` | Vendored sources: LASRecomp, Vulkan-Headers, VulkanMemoryAllocator, Dynamic-FPS patch |
+| `third_party/` | Vendored sources: LASRecomp, Vulkan-Headers, VulkanMemoryAllocator, Dear ImGui, Dynamic-FPS patch |
 | `docs/` | How it works, troubleshooting, development notes |
 | `tools/` | *(created by setup)* Python, Zig, glslang, NSTool |
 | `game/` | *(created by setup)* your extracted update code, metadata and `romfs.bin` |
@@ -306,4 +320,6 @@ their own licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - [NSTool](https://github.com/jakcron/nstool), [Zig](https://ziglang.org/),
   [glslang](https://github.com/KhronosGroup/glslang), [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers),
   [VulkanMemoryAllocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
+  [Dear ImGui](https://github.com/ocornut/imgui) (the in-game menu),
+  PlayStation button icons: "PS5 Button Icons and Controls" by Zacksly (CC BY 3.0 | [zacksly.itch.io](https://zacksly.itch.io)), reduced in size,
   [Capstone](https://www.capstone-engine.org/), [lz4](https://github.com/python-lz4/python-lz4).

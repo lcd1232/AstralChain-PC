@@ -9,7 +9,7 @@
   --compiler tools\zig\zig.exe --output build\<new folder> --instructions 4000000 --sample-steps 0 `
   --run-timeout 86400 --unbounded --chain --follow 0 --entry rtld:start --seed-all-text --build cached `
   --control game\control.nacp --romfs game\romfs.bin --nvn-hle --nvn-backend vulkan `
-  --optimize --lean --direct-calls --jumps `
+  --optimize --lean --direct-calls --jumps --entry-labels --restrict `
   --patch third_party\AstralChain-Dynamic-FPS\1.0.1.pchtxt --patch astral_chain\patches\cutscene-catchup-1.0.1.pchtxt `
   --build-only
 powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 300 -Env "AC_PARALLEL=1"
@@ -21,6 +21,15 @@ powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 3
 - Each build writes `run-env.txt`, holding addresses that move with `main`'s size, and `run_guarded.ps1` reads
   it.
 - Always run through `run_guarded.ps1`.
+- `--entry-labels`: a page function's switch has a case only where execution can enter from outside (branch and
+  call targets from other pages, return addresses, code pointers of the relocations and symbols, jump-table
+  targets, loop heads, the instruction after an unconditional jump), so the compiler optimizes across the code
+  between them; each page also gets an unoptimized fallback function with every instruction, for an entry the
+  analysis missed, which returns at the next entry. `AC_FALLBACK_LOG=1` prints the most frequent fallback entries.
+  With `--restrict` (the Cpu pointer does not alias guest memory), a busy scene's main thread took 11.1 ms a frame
+  instead of 13.3 (`linux/benchmark.py`, 2026-11-02). The executable is about twice as large.
+- `linux/benchmark.py`: a repeatable frame-rate run from a frozen save (`--capture-save` first); prints each busy
+  thread's CPU milliseconds a frame. `--variants`/`--env` compare settings.
 
 ## Unattended test runs
 
@@ -62,21 +71,25 @@ powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 3
 | `AC_TRACE_CALLS=1` | Per-call SVC/IPC/audio/HID log lines (off in play builds) |
 | `LARECOMP_SKIP_UNBUILT=1` | Skip draws whose pipeline is still compiling, instead of waiting for it |
 | `LARECOMP_TEX_FULLHASH=1` | Hash every texture fully at each check (slow; rules change detection in or out) |
-| `AC_ASYNC_SUBMIT=1` | (launcher: *Prepare graphics on a separate thread*) Queue submissions, fences and presents to a worker thread that runs the Vulkan backend (`objects.c`); other NVN calls wait for the queue unless `nvn_async_safe`. The profile line counts the waits (`async drains`, `fence waits`) |
+| `AC_ASYNC_SUBMIT=0` (on by default) | (launcher: *Prepare graphics on a separate thread*) Queue submissions, fences and presents to a worker thread that runs the Vulkan backend (`objects.c`); other NVN calls wait for the queue unless `nvn_async_safe`. The profile line counts the waits (`async drains`, `fence waits`) |
+| `AC_CPU_PLACEMENT=0` (on by default, Linux) | On hybrid Intel CPUs (`/sys/devices/cpu_core`), once a second the busiest guest threads and the render worker (CPU time less spin-wait time, which `native_trace.py` adds to `rt_spin_tsc`) run on the performance cores, every other registered thread on the efficiency cores (`cpu_placement.h`; 40 to 52 fps in a busy scene on a Core Ultra X7 358H). `AC_CPU_PLACEMENT_LOG=1` prints each thread's work every second |
 | `LARECOMP_VK_WW_BATCH=0` | One write tracking query per texture check, as before the batched checks (`exec.c` `ww_written_pages`); the profile line's `write watch` part counts the queries by caller |
 | `AC_GPU_HANG_MS=<ms>` | GPU hang stop threshold (default 1200) |
 | `LARECOMP_DUMP_TEX=<min width>` | Level-0 data of up to 24 textures (as uploaded, unswizzled) to `tex_*.bin` in the run folder |
 | `LARECOMP_DUMP_ASTC=<min width>` | Blocks and CPU decode of up to 16 ASTC textures (with `LARECOMP_GPU_ASTC=0`) to `astc_*.bin` |
 | `LARECOMP_GPU_ASTC=0` | Decode ASTC on the CPU, as before the GPU decoder |
 | `LARECOMP_BC7=1` | (launcher: *Texture compression*) Store ASTC textures as BC7 (`bc7_gpu.c`): precomputed ones from `cache\bc7` if there, the others recompressed on the GPU. Logs `[vk] BC7: ...`; the 2-s profile line shows `video memory` and the precomputed hits / misses |
-| `AC_BC7_PRECOMPUTE=1` | (setup; launcher: *prepared at setup*) `setup_game` encodes every ASTC texture to BC7 into `build\game\cache\bc7` (`bc7_cache.py`, once) |
+| `AC_BC7_PRECOMPUTE=1` | (setup; launcher: *prepared at setup*, Linux: *Prepare BC7 textures at setup*) `setup_game` encodes every ASTC texture to BC7 into `build\game\cache\bc7` (`bc7_cache.py`, once; the encoder is a DLL on Windows, a shared library on Linux). Once prepared, `LARECOMP_BC7` left unset means on |
 | `LARECOMP_BC7_CACHE=0` | Ignore the precomputed BC7 textures (GPU conversion only) |
 | `LARECOMP_BC7_LOG=1` | One `[bc7key]` line per ASTC texture upload: hash, layout, precomputed hit or miss |
 | `AC_KEYS=A:74,B:75,...` | (launcher **Controls**) Main bindings as Windows virtual-key codes: `A B X Y LSTICK RSTICK L R ZL ZR PLUS MINUS DLEFT DUP DRIGHT DDOWN LLEFT LUP LRIGHT LDOWN RLEFT RUP RRIGHT RDOWN`; unlisted ones keep their default, 0 for none. Mouse buttons are 1 2 4 5 6 (left, right, middle, back, forward), the wheel 14 / 15 (up / down). Defaults and parser: `runtime/las/input_bindings.h` (kept in step with `ControlsForm`) |
 | `AC_KEYS2=...` | The alternative bindings, same format |
 | `AC_MOUSE_LOOK=0` | (launcher: *Mouse moves the camera* off) The mouse keeps its buttons but does not drive the right stick (`mouse.h`: raw input, speed to stick tilt, 20% minimum against the game's dead zone) |
 | `AC_MOUSE_SENS=<percent>` / `AC_MOUSE_INVERT=1` | Mouse camera sensitivity (100: full tilt at 1500 counts/s) and inverted up/down |
-| `AC_PROMPTS=switch` | (launcher: *Button icons*) Keep the Switch button icons. Otherwise `las/button_prompts.c` redraws the game's button icon atlas (ui_core `core.wtp` texture 0, 256x512 RGBA8, found by its content hash through the `texpatch` hooks of `textures.c`) with the main bindings |
+| `AC_VIBRATION=<percent>` (100) | Controller vibration strength, 0 to 200 (0: off; in-game menu). The game's HD Rumble low bands drive the left motor, the high bands the right one, on every connected pad (`hid_service.h`, `XInputSetState`: `SDL_RumbleGamepad` on Linux) |
+| `AC_INPUT_LOG=1` | Logs each change of the buttons the game receives (`HID input t=… buttons=0x…`, bit 8 ZL, bit 9 ZR) to `trace.log`, and when input is held back (window not focused, in-game menu) |
+| `AC_SETTINGS_FILE=<file>` | The in-game menu's settings (`las/menu.cpp`, opened by F1 or Minus+Plus): `NAME=value` lines of `AC_*` / `LARECOMP_*` settings, put into the environment at the start of `main` (`game_settings.h`), so a setting read once needs nothing more; the live ones (frame limit, prompts, mouse, cutscene fps, focus, snapshots, audio resync) are read again through `setting_int` when the menu changes them. A variable already in the environment wins and is shown fixed. The Linux launcher points it at `settings.ini` in the install folder |
+| `AC_PROMPTS=switch` / `xbox` / `ps` | (launcher: *Button icons*) `switch` keeps the Switch button icons; `xbox` and `ps` redraw the face buttons, shoulders, triggers and +/- of the atlas with that controller's labels, by position (`AC_PROMPTS_DUMP=<dir>` writes the atlas before and after as raw RGBA). Otherwise `las/button_prompts.c` redraws the game's button icon atlas (ui_core `core.wtp` texture 0, 256x512 RGBA8, found by its content hash through the `texpatch` hooks of `textures.c`) with the main bindings |
 | `LARECOMP_ASTC_VERIFY=<n>` | Read back the first n texture levels the GPU decodes and compare them with the CPU decoder (`ASTC verify` lines; slow) |
 | `LARECOMP_NO_PIPE_WARM=1` | No pipeline warm-up (pipelines are built at their first draw only) |
 | `LARECOMP_GPL=0` | No shader libraries (`VK_EXT_graphics_pipeline_library`): pipelines are compiled whole at their first draw |

@@ -1,0 +1,33 @@
+@nsobid-4B159F0F7A360669738390EE8657B4F0
+// Astral Chain v1.0.1: pre-rendered movies (the opening cutscene: 1600x900, 30 FPS, 8726 frames) keep their picture
+// with their sound.
+//
+// The movie player's frame clock (run time 0x70007103E0; its clock, 0x7000710FB0, is the system
+// tick in ms) re-anchored itself when the picture fell behind it by more than twice [player+0x64C] (66 ms): the start
+// time [+0x644] was cleared and taken again from the frame then due, so the sound, which plays on by itself, stayed
+// ahead by the whole delay for the rest of the movie. One stall over 132 ms (a slow first frame, an area loading)
+// left 0.65-1.4 s between the voices and the lips in the opening cutscene, different at each start (measured
+// against two Switch recordings). Here a late picture keeps its clock while it is
+// less than 2 s behind: it is "due" until it has caught up, so the player decodes the next frames back to back and the
+// picture rejoins its sound. Further behind, the player starts its clock again as before: the title screen's
+// background movie starts its clock while the game is still loading, and catching that up held the title's "ZL + ZR"
+// prompt back (19 s after the title appeared against ~4 s on a Switch, 2026-11-02).
+//
+// 0x7004E0 (run time 0x70007104E0; this file's offsets + 0x7000010000 are run-time addresses, as for the svc #0xB1
+// of cutscene-catchup-1.0.1.pchtxt at 0x7000A1EFD4): ldr w8, [x19, #0x64c] (the threshold, compared doubled with how
+// late the frame is) -> mov w8, #1000: a frame up to 2 s late is due (b.le 0x700071040C), a later one clears the
+// start time.
+
+//
+// Movies at 30 FPS: the player's frame clock (0x70007103E0) runs every frame while a movie plays; its "mov x19, x0"
+// at 0x70007103EC becomes svc #0xB3, which the runtime runs (host_runtime.c.in) and takes as "a movie is playing":
+// the frames are presented at 30 FPS meanwhile (nvn_hle.h nvn_present_pace), as on the Switch. At 60 FPS the title
+// screen's background movie showed, every few frames, an old picture of the whole screen for one refresh (10-16 in
+// 12 s recorded at 60 FPS; none at 30 FPS; 2026-11-02). AC_MOVIE_FPS=60: as fast as the rest.
+
+@flag offset_shift 0x100
+
+@enabled
+007003EC 611600D4 // svc #0xB3 (was mov x19, x0): a movie plays this frame
+007004E0 087D8052 // mov w8, #1000 (was ldr w8, [x19, #0x64c]): catch up to 2 s, else start the clock again
+@stop

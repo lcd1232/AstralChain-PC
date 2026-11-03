@@ -4,10 +4,12 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import threading
 
 from .containers import FormatError
+from . import host
 
-FLAGS=['-target','x86_64-windows-gnu','-O1','-mcx16']
+FLAGS=[*host.target(),'-O1','-mcx16']
 SUPPORT='''#include "cpu.h"
 extern __thread uint64_t native_executed_steps;  /* per host thread (parallel mode: a shared counter bounced between cores) */
 extern const uint64_t native_instruction_limit;
@@ -52,7 +54,7 @@ def run_compiler(command,timeout=300):
         try:
             stdout,stderr=process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,timeout=15)
+            host.kill_tree(process)
             process.kill();process.communicate(timeout=15)
             raise
         return subprocess.CompletedProcess(command,process.returncode,stdout,stderr)
@@ -74,7 +76,8 @@ def build(compiler,reference,units,source,folder,cache,workers=4,extra_objects=(
     compiler=Path(compiler).resolve();reference=Path(reference).resolve()
     folder=Path(folder).resolve();cache=Path(cache).resolve();cache.mkdir(parents=True,exist_ok=True)
     provenance={'compiler_sha256':digest_file(compiler),'flags':FLAGS,
-                'headers':{p.name:digest_file(p) for p in sorted((reference/'runtime').glob('*.h'))}}
+                'headers':{p.name:digest_file(p) for p in sorted((reference/'runtime').glob('*.h'))},
+                'target':host.TARGET}
     identity=json.dumps(provenance,sort_keys=True).encode()
     def compile_unit(item):
         group,text=item
@@ -92,14 +95,23 @@ def build(compiler,reference,units,source,folder,cache,workers=4,extra_objects=(
         result.check_returncode()
         manifest.write_text(json.dumps({'key':key,'sha256':digest_file(obj),'provenance':provenance},indent=2)+'\n',encoding='utf-8')
         return group,obj,False
+    # (progress for the launcher window, launcher.py: "label: done/total" lines, rewritten in place in a terminal)
+    lock=threading.Lock();done=[0]
+    def counted(item):
+        result=compile_unit(item)
+        with lock:
+            done[0]+=1
+            print(f'\r  Compiling the game: {done[0]}/{len(units)}',end='',flush=True)
+        return result
     # Distinct groups have distinct emitted page names, hence distinct keys.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        compiled=list(executor.map(compile_unit,sorted(units.items())))
+        compiled=list(executor.map(counted,sorted(units.items())))
+    print('\n  Linking the game',flush=True)
     src=folder/'trace.c';src.write_text(source,encoding='utf-8')
-    command=[str(compiler),'cc',*FLAGS,'-I',str(Path(__file__).parent/'runtime'),'-I',str(reference/'runtime'),str(src),
-             *(str(obj) for _,obj,_ in compiled),*(str(obj) for obj in extra_objects),'-lbcrypt','-luser32',
-             '-Wl,--stack,67108864',  # 64 MB main-thread stack: direct calls nest page functions along guest calls
-             '-o',str(folder/'trace.exe')]
+    # 64 MB main-thread stack (host.main_flags): direct calls nest page functions along guest calls
+    command=[str(compiler),'cc',*FLAGS,*host.shim_include(),'-I',str(Path(__file__).parent/'runtime'),'-I',str(reference/'runtime'),
+             *host.main_flags(),str(src),*(str(obj) for _,obj,_ in compiled),*(str(obj) for obj in extra_objects),
+             *host.link_flags(compiler,cache,folder,main=True),'-o',str(folder/'trace.exe')]
     result=run_compiler(command)
     (folder/'compiler.log').write_text(result.stdout+result.stderr,encoding='utf-8')
     stats={'units':len(compiled),'reused':sum(hit for _,_,hit in compiled),'compiled':sum(not hit for _,_,hit in compiled)}

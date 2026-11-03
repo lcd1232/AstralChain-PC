@@ -539,6 +539,17 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// A fence: the work before it is submitted now, as the game's nvnQueueFlush would do on the hardware (ours does nothing)
+// before anything waits for it. Without it, a wait on a fence of work not submitted yet was cut short at what had been
+// submitted (renderer_wait_target), and the game went on to reuse memory that work still read: single frames of the UI
+// atlas over the picture (Steam Deck, an Intel laptop). LARECOMP_FENCE_SUBMIT=0: the old behaviour.
+uint64_t renderer_fence_submit(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FENCE_SUBMIT"); on = !e || atoi(e) != 0; }
+    if (on) renderer_submit();
+    return renderer_fence_seq();
+}
+
 // Astral Chain: cooperative waits. The submission a fence wait needs (capped at what has been submitted, as
 // renderer_wait_seq does), and whether the GPU has finished it; nvn_hle.h parks only the waiting guest thread.
 uint64_t renderer_wait_target(uint64_t seq) {
@@ -2912,6 +2923,11 @@ static void gmem_sync(void) {
 typedef struct { uint64_t seq, addr, size; VkBuffer buf; VmaAllocation mem; void *ptr; } GmemWb;
 static GmemWb wb_pending[64], wb_flight[256];
 static int wb_npend, wb_nflight;
+// wb_flight and the lazy write-back tables below: the submitting thread adds (gmem_wb_record), whichever thread sees a
+// submission complete applies (gmem_writeback_apply, from renderer_seq_done: with AC_ASYNC_SUBMIT the game's thread
+// waiting on a fence while the worker submits). Unlocked, the two met: an entry applied twice, its staging buffer
+// destroyed twice, glibc's heap corrupted ("corrupted size vs. prev_size", 2026-11-02).
+static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
 static void gmem_wb_note(uint64_t addr, uint64_t size) {
     if (!gmem_alloc || !size || addr < HEAP_BASE || addr - HEAP_BASE + size > gmem_size) return;
     for (int i = 0; i < wb_npend; i++)
@@ -2933,8 +2949,10 @@ static void gmem_wb_record(VkCommandBuffer cb, uint64_t seq) {
         w->seq = seq;
         VkBufferCopy cp = {w->addr - HEAP_BASE, 0, w->size};
         vkCmdCopyBuffer(cb, gmem_buf, w->buf, 1, &cp);
+        pthread_mutex_lock(&lazy_lock);
         if (wb_nflight == 256) FATAL("heap mirror: too many GPU write-backs in flight\n");
         wb_flight[wb_nflight++] = *w;
+        pthread_mutex_unlock(&lazy_lock);
     }
     wb_npend = 0;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
@@ -2959,7 +2977,6 @@ static Lazy lazy_tab[LAZY_MAX], lazy_free[LAZY_MAX];
 static int lazy_nfree;
 static struct { uint64_t addr, size; } lazy_hot[LAZY_HOT_MAX];  // ranges the CPU reads: eager write-back
 static int lazy_nhot;
-static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
 extern int nvn_page_protect(uint64_t addr, uint64_t size, int noaccess);
 extern void (*nvn_lazy_flush_hook)(uint64_t addr, uint64_t size);
 extern int (*nvn_lazy_fault_hook)(uint64_t addr);
@@ -3119,16 +3136,35 @@ static void gmem_writeback_apply(uint64_t done) {
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    // Astral Chain: the device-local mirror by default. The host-pointer import (AC_VK_HEAP_IMPORT=1) made the
-    // NVIDIA driver log bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19).
+    // Astral Chain: on a discrete GPU the device-local mirror. The host-pointer import made the NVIDIA driver log
+    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). AC_VK_HEAP_IMPORT=1 imports
+    // the heap instead (as the TotK port does): on an integrated GPU the mirror is a second copy of the same system
+    // memory (2.8 GB). Once imported, the heap's write tracking stops (nvn_hle.h written_pages): on Linux each tracking
+    // query protects the written pages again, and on an imported (pinned) range the driver (Mesa ANV on Xe) pinned them
+    // again - most of the render thread's time in the kernel, 8-17 fps on an Arc B390. Without tracking, the texture
+    // checks hash contents and the vertices are read in place: in a busy scene on that Arc B390 (~1000 draws a frame)
+    // 30-35 fps against 48-57 with the mirror (2026-11-02), so the mirror stays the default. A failed import falls back
+    // to the mirror.
     static int import = -1;
-    if (import < 0) import = getenv("AC_VK_HEAP_IMPORT") && g_vk.host_import;
+    if (import < 0) {
+        const char *e = getenv("AC_VK_HEAP_IMPORT");
+        import = g_vk.host_import && e && atoi(e) != 0;
+        LOG("[vk] guest heap for shader global memory: %s\n", import ? "imported (no copy)" : "mirrored in device memory");
+    }
     if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL;
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
-    if (!off && want > gmem_size && !(import ? gmem_import(want) : gmem_mirror(want))) {
-        LOG("[vk] guest heap for shader global memory unavailable (%llu MB): reads return zero\n", (unsigned long long)(want >> 20));
-        off = 1;
+    if (!off && want > gmem_size) {
+        bool ok = import && gmem_import(want);
+        if (import && !ok) {
+            LOG("[vk] guest heap import failed: mirrored instead\n");
+            import = 0;
+        }
+        if (!ok) ok = gmem_mirror(want);
+        if (!ok) {
+            LOG("[vk] guest heap for shader global memory unavailable (%llu MB): reads return zero\n", (unsigned long long)(want >> 20));
+            off = 1;
+        }
     }
     if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
     static uint32_t zero[1024];
@@ -3144,6 +3180,10 @@ static VkDescriptorBufferInfo gmem_info(void) {
 // inside them use that copy, and a shader that stores gets the ranges copied back to the heap right after it (the
 // game alternates its buffer sets per frame: the CPU isn't writing them meanwhile). Accesses outside the table use
 // the heap as before. LARECOMP_VK_GMEM_FAST=0: no copy (empty table: everything goes to the heap, the old behaviour).
+// Integrated GPUs (Intel, AMD APUs, the Steam Deck) share system memory, so the heap is no farther than the copy: there
+// the copies are off by default (LARECOMP_VK_GMEM_FAST=1 turns them on). On an Intel Arc B390 (Mesa ANV) recording the
+// two copies cost ~15 ms of CPU each, and the highway chase's effects, six such dispatches a frame, ran at 5-6 fps
+// (46-56 fps without them).
 #define GFAST_SIZE (32ull << 20)
 static VkBuffer gfast_buf;
 static VmaAllocation gfast_mem;
@@ -3164,7 +3204,11 @@ static VkDescriptorBufferInfo gfast_info(void) {
 
 static void gfast_prepare(VkCommandBuffer cb) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LARECOMP_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VK_GMEM_FAST");
+        on = e ? atoi(e) != 0 : g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        LOG("[vk] compute global memory copies %s\n", on ? "on" : e ? "off (LARECOMP_VK_GMEM_FAST=0)" : "off (integrated GPU: shared memory)");
+    }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
     gmem_info();  // (the heap import, made on first use)
@@ -3408,6 +3452,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         }
     }
     if (!vc_on || !gmem_buf || size > VC_MAX_RANGE) return false;
+    if (!gmem_alloc) return false;  // (imported heap: no write tracking then, the GPU reads the vertices in place)
     uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     if (hi > gmem_size) return false;
     uint64_t pend = vk_pending_seq();
@@ -4845,10 +4890,15 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
         VkImageView ei[3] = {v};
         post_pass(cb, "easu.frag", ei, 1, e, pe, false);
-        float pr[8] = {exp2f(-0.2f), 0, 0, 0, (float)ow, (float)oh};  // (sharpness 0.2 stops: AMD's default)
-        VkImageView ri_[3] = {post_view(e)};
-        post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
-        v = post_view(r);
+        extern float g_fsr_sharpness;  // (device.c present_settings: 0..100, 0 = no RCAS)
+        if (g_fsr_sharpness > 0) {
+            float pr[8] = {exp2f(-(100 - g_fsr_sharpness) / 50.0f), 0, 0, 0, (float)ow, (float)oh};
+            VkImageView ri_[3] = {post_view(e)};
+            post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
+            v = post_view(r);
+        } else {
+            v = post_view(e);
+        }
     }
     vk_full_barrier(cb);
     vk_frame_resume();
@@ -5125,7 +5175,8 @@ static void exec_list(uint64_t handle, int depth) {
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
-            if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
+            uint64_t fence = renderer_fence_submit();
+            if (r->x[1]) nvn_sync_set_seq(r->x[1], fence);
             break;
         }
         case CMD_RESET_COUNTER:

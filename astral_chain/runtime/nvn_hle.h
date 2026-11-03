@@ -26,6 +26,17 @@ static const struct {const char *name;NvnHostFunction host;} nvn_host_table[]={
 /* Vendored LASRecomp NVN implementations (runtime/las) register through COFF
  * section .hle$m. These markers sort before and after it within .hle. */
 typedef struct {const char *name;NvnHostFunction fn;} NvnLinkedEntry;
+#ifdef __linux__
+/* ELF: no '$' sorting; the entries' section ac_nvn_hle (las/hle.h) is bounded by the linker's symbols. */
+extern const NvnLinkedEntry __start_ac_nvn_hle[] __attribute__((weak)),__stop_ac_nvn_hle[] __attribute__((weak));
+static NvnHostFunction nvn_linked_lookup(const char *name) {
+ const NvnLinkedEntry *first=__start_ac_nvn_hle,*last=__stop_ac_nvn_hle;
+ __asm__("" : "+r"(first), "+r"(last));
+ for(const NvnLinkedEntry *e=first;e && e<last;e++)
+  if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
+ return NULL;
+}
+#else
 __attribute__((used,section(".hle$a"))) static const NvnLinkedEntry nvn_linked_first={0,0};
 __attribute__((used,section(".hle$z"))) static const NvnLinkedEntry nvn_linked_last={0,0};
 static NvnHostFunction nvn_linked_lookup(const char *name) {
@@ -33,6 +44,7 @@ static NvnHostFunction nvn_linked_lookup(const char *name) {
   if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
  return NULL;
 }
+#endif
 /* Bounded NUL-terminated guest string inside one readable region. */
 static int nvn_guest_name(uint64_t address,char *out) {
  if(!address)return 0;
@@ -173,6 +185,19 @@ static void nvn_lock(void) {
  nvn_owner=me;nvn_depth=1;
 }
 static void nvn_unlock(void) {if(--nvn_depth==0) {nvn_owner=0;ReleaseSRWLockExclusive(&nvn_srw);}}
+#define NVN_MAIN_FUNCS 1024
+static uint64_t nvn_main_qpc[NVN_MAIN_FUNCS],nvn_main_calls[NVN_MAIN_FUNCS];
+static void nvn_main_report(double qpc_hz) {
+ printf("; main thread's slowest nvn calls (ms, calls):");
+ for(int k=0;k<6;k++) {
+  unsigned best=0;uint64_t most=0;
+  for(unsigned i=0;i<NVN_MAIN_FUNCS && i<nvn_thunk_count;i++) if(nvn_main_qpc[i]>most) {most=nvn_main_qpc[i];best=i;}
+  if(!most) break;
+  printf(" %s %.1f %llu",nvn_thunks[best].name,1000.0*(double)most/qpc_hz,(unsigned long long)nvn_main_calls[best]);
+  nvn_main_qpc[best]=0;
+ }
+ memset(nvn_main_qpc,0,sizeof(nvn_main_qpc));memset(nvn_main_calls,0,sizeof(nvn_main_calls));
+}
 static int hle_intercept(Cpu *c) {
  if(!nvn_hle_configured) {
 #ifndef LEAN_PAGES
@@ -180,7 +205,7 @@ static int hle_intercept(Cpu *c) {
 #endif
   /* Lean builds have no cooperative checkpoints in translated code: parallel mode only. */
   parallel_mode=LEAN_PAGES || GetEnvironmentVariableA("AC_PARALLEL",NULL,0)!=0;
-  if(parallel_mode) {live_cpu[0]=&state;printf("PARALLEL guest threads on host threads\n");}
+  if(parallel_mode) {live_cpu[0]=&state;printf("PARALLEL guest threads on host threads\n");cpu_place_register(0,NULL);}
   return hle_intercept_body(c);
  }
  if(!parallel_mode) return hle_intercept_body(c);
@@ -199,6 +224,11 @@ static int hle_intercept(Cpu *c) {
  if(nvn) nvn_unlock(); else kunlock();
  if(timed && nvn && current_thread<33) {
   QueryPerformanceCounter(&t1);nvn_thread_qpc[current_thread]+=(uint64_t)(t1.QuadPart-t0.QuadPart);nvn_thread_calls[current_thread]++;
+  /* the main thread's calls by function (AC_PARALLEL_STATS: the slowest in the stats line) */
+  if(current_thread==0 && pc>=NVN_HLE_BASE) {
+   unsigned f=(unsigned)((pc-NVN_HLE_BASE)/NVN_HLE_STRIDE);
+   if(f<NVN_MAIN_FUNCS) {nvn_main_qpc[f]+=(uint64_t)(t1.QuadPart-t0.QuadPart);nvn_main_calls[f]++;}
+  }
  }
  if(guest_threads[current_thread].status!=THREAD_RUNNABLE) {klock();parallel_block();kunlock();}
  return handled;
@@ -234,7 +264,16 @@ uint64_t plat_now_ns(void) {
  QueryPerformanceCounter(&now);
  return (uint64_t)((unsigned __int128)now.QuadPart*1000000000u/(uint64_t)frequency.QuadPart);
 }
+#ifdef __linux__
+/* Linux: the kernel's precise absolute sleep on plat_now_ns's clock (QueryPerformanceCounter is CLOCK_MONOTONIC), not
+ * a Sleep(0) spin for the whole wait. */
+void plat_sleep_until_ns(uint64_t t) {
+ struct timespec ts={(time_t)(t/1000000000u),(long)(t%1000000000u)};
+ while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,NULL)==EINTR) {}
+}
+#else
 void plat_sleep_until_ns(uint64_t t) {for(uint64_t now=plat_now_ns();now<t;now=plat_now_ns())Sleep(0);}
+#endif
 /* Background work (texture warm-up decodes, cache saves) below normal priority: it must not delay the game's sound thread. */
 void plat_thread_background(void) {SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);}
 /* Pages of [addr,addr+size) written by the CPU since the last query of them
@@ -273,7 +312,12 @@ static void track_harvest(uint64_t lo,uint64_t hi) {
  static LARGE_INTEGER wwf;if(!wwf.QuadPart) QueryPerformanceFrequency(&wwf);
  LARGE_INTEGER ww1;QueryPerformanceCounter(&ww1);prof_ww_qpc+=(uint64_t)(ww1.QuadPart-ww0.QuadPart)*1000000000ull/(uint64_t)wwf.QuadPart;
 }
+/* Not once the heap is imported by the GPU (heap_gpu_pinned, exec.c gmem_import): a query protects the written pages
+ * again, and on Linux each such change of an imported range made the driver pin its pages again (most of the render
+ * thread's time in the kernel). The heap mirror is gone then and the GPU reads guest memory itself: the vertex cache
+ * is off (vertices read in place) and texture checks compare contents. */
 static int written_pages(uint64_t addr,uint64_t size,uint64_t *pages,int max,uint64_t *page,int harvest) {
+ if(heap_gpu_pinned) return -1;
  if(max<=0 || addr<heap_base || size>HEAP_LIMIT || addr-heap_base>HEAP_LIMIT-size) return -1;
  uint64_t lo=addr&~4095ull,hi=(addr+size+4095)&~4095ull;
  if(hi-heap_base>HEAP_LIMIT) hi=heap_base+HEAP_LIMIT;
@@ -293,6 +337,7 @@ static int plat_written_pages_u(uint64_t addr,uint64_t size,uint64_t *pages,int 
  * ranges inside it without a system call each (plat_written_pages_harvested): writes after that harvest are seen
  * at the next one. */
 static int plat_write_harvest_u(uint64_t addr,uint64_t size) {
+ if(heap_gpu_pinned) return -1;
  if(!size || addr<heap_base || size>HEAP_LIMIT || addr-heap_base>HEAP_LIMIT-size) return -1;
  uint64_t lo=addr&~4095ull,hi=(addr+size+4095)&~4095ull;
  if(hi-heap_base>HEAP_LIMIT) hi=heap_base+HEAP_LIMIT;
@@ -383,7 +428,16 @@ static void nvn_heap_mirror_clean_u(uint64_t addr,uint64_t size) {
 int plat_written_pages(uint64_t addr,uint64_t size,uint64_t *pages,int max,uint64_t *page) {AcquireSRWLockExclusive(&track_srw);int r=plat_written_pages_u(addr,size,pages,max,page);ReleaseSRWLockExclusive(&track_srw);return r;}
 int plat_write_harvest(uint64_t addr,uint64_t size) {AcquireSRWLockExclusive(&track_srw);int r=plat_write_harvest_u(addr,size);ReleaseSRWLockExclusive(&track_srw);return r;}
 int plat_written_pages_harvested(uint64_t addr,uint64_t size,uint64_t *pages,int max,uint64_t *page) {AcquireSRWLockExclusive(&track_srw);int r=plat_written_pages_harvested_u(addr,size,pages,max,page);ReleaseSRWLockExclusive(&track_srw);return r;}
-void nvn_heap_mirror_interest(uint64_t addr,uint64_t size) {AcquireSRWLockExclusive(&track_srw);nvn_heap_mirror_interest_u(addr,size);ReleaseSRWLockExclusive(&track_srw);}
+/* A range registered once stays registered (the list only grows): a range this thread registered recently returns
+ * without the lock and the page walk. Every draw registers its vertex, index and storage buffers again, ~16 ms a
+ * second of the render thread in a busy scene (2026-11-02). */
+void nvn_heap_mirror_interest(uint64_t addr,uint64_t size) {
+ static __thread struct {uint64_t addr,size;} seen[1024];
+ uint64_t h=(addr*0x9E3779B97F4A7C15ull)^(size*0xC2B2AE3D27D4EB4Full);unsigned i=(unsigned)(h>>32)&1023;
+ if(seen[i].addr==addr && seen[i].size==size && size) return;
+ AcquireSRWLockExclusive(&track_srw);nvn_heap_mirror_interest_u(addr,size);ReleaseSRWLockExclusive(&track_srw);
+ seen[i].addr=addr;seen[i].size=size;
+}
 int nvn_heap_mirror_dirty(uint64_t limit,uint64_t *pages,int max) {AcquireSRWLockExclusive(&track_srw);int r=nvn_heap_mirror_dirty_u(limit,pages,max);ReleaseSRWLockExclusive(&track_srw);return r;}
 void nvn_heap_mirror_mark_all(uint64_t limit) {AcquireSRWLockExclusive(&track_srw);nvn_heap_mirror_mark_all_u(limit);ReleaseSRWLockExclusive(&track_srw);}
 void nvn_heap_mirror_clean(uint64_t addr,uint64_t size) {AcquireSRWLockExclusive(&track_srw);nvn_heap_mirror_clean_u(addr,size);ReleaseSRWLockExclusive(&track_srw);}
@@ -408,18 +462,43 @@ int nvn_host_cpu_count(void) {SYSTEM_INFO info;GetSystemInfo(&info);return (int)
 void *nvn_host_window(void) {
  app_open();
  SetWindowTextW(app_window,L"Astral Chain (native)");
- RECT r={0,0,1600,900};AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
- SetWindowPos(app_window,NULL,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+ app_window_size_apply(app_window);
  {char v[8];DWORD n=GetEnvironmentVariableA("AC_FULLSCREEN",v,sizeof(v));if(n && n<sizeof(v) && atoi(v)) app_set_fullscreen(app_window,1);}
  app_pump();
  return app_window;
 }
 /* Display pacing: 60 Hz vsync grid in rt_ticks (19.2 MHz). Each present waits for
  * the first vsync at least `interval` refreshes after the previous present.
- * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1). */
+ * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1).
+ * AC_FPS_LIMIT=<20..60> paces on a grid of that rate instead of 60 Hz (a steady 40 fps on handhelds such as the
+ * Steam Deck; the game's step follows the measured frame time, so it runs at the right speed). */
+unsigned nvn_present_count;  /* (presents so far: svc #0xB3 marks the last one a movie played in) */
+unsigned movie_plane_mark;   /* (textures.c: the last present a full-screen movie's luma plane was uploaded in) */
 void nvn_present_pace(int interval) {
  static int override=-2;
- if(override==-2) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;}
+ static uint64_t period=320000; /* 19.2 MHz / 60 Hz */
+ static uint64_t origin,last_vsync;
+ if(override==-2) {
+  char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;
+ }
+ {  /* (the in-game menu changes it while the game runs) */
+  static int limit=60;
+  SETTING_LIVE(limit,"AC_FPS_LIMIT",60);
+  uint64_t want=limit>=20 && limit<60 ? 19200000ull/(uint64_t)limit : 320000;
+  /* (the slots count in periods: a new period starts the cadence again, else the next slot is seconds away) */
+  if(want!=period) {period=want;origin=0;printf("NVN frame limit %d fps\n",limit>=20 && limit<60 ? limit : 60);}
+ }
+ {  /* AC_HANDHELD from the in-game menu (Resolution): the Switch leaves or enters its dock while the game runs; the
+     * game hears it as on the console (applet messages 30 / 31, app_window.h) and changes its resolution itself. */
+  static int handheld;
+  SETTING_LIVE(handheld,"AC_HANDHELD",0);
+  app_modes_load();
+  unsigned operation=handheld==1 ? 0 : 1;
+  if(operation!=app_operation_mode) {
+   app_set_modes(operation,operation ? PERFORMANCE_MODE : 0);
+   printf("[app] %s (AC_HANDHELD=%d)\n",operation ? "docked" : "handheld",handheld);
+  }
+ }
  static unsigned presents;
  if(!(++presents%60)) {fflush(stdout);fflush(stderr);} /* long runs end by timeout; keep the log current */
  static int logged_interval=-1;
@@ -427,10 +506,17 @@ void nvn_present_pace(int interval) {
  if(override>=0) interval=override;
  /* AC_CUTSCENE_FPS=30: cutscenes at 30 FPS, as in the unmodified game (svc #0xB1 in host_runtime.c.in). */
  extern int cutscene_mode;
- if(cutscene_mode && interval>0 && interval<2) interval=2;
+ extern unsigned movie_present_mark;
+ /* Movies (svc #0xB3, movie-sync-1.0.1.pchtxt): at 30 FPS while one played in the last 4 presents and a full-screen
+  * one's frames (1280x720 or larger, textures.c) arrived in the last 8, as on the Switch: not for the movies on screens
+  * in the game's world, which kept the game itself at 30 FPS. AC_MOVIE_FPS=60: as fast as the rest. */
+ static int movie_fps=30;
+ SETTING_LIVE(movie_fps,"AC_MOVIE_FPS",30);
+ int movie=movie_fps!=60 && nvn_present_count-movie_present_mark<4u && nvn_present_count-movie_plane_mark<8u;
+ {static int was;if(movie!=was) {printf("NVN movie %s\n",movie ? "playing: 30 FPS" : "ended");was=movie;}}
+ nvn_present_count++;
+ if((cutscene_mode || movie) && interval>0 && interval<2 && period==320000) interval=2;
  if(interval<=0) return;
- static uint64_t origin,last_vsync;
- const uint64_t period=320000; /* 19.2 MHz / 60 Hz */
  uint64_t now=rt_ticks();
  if(!origin) {origin=now;last_vsync=0;return;}
  /* Adaptive: a frame that missed its slot (last + interval) is shown at once
@@ -451,7 +537,15 @@ void nvn_present_pace(int interval) {
  unsigned others=0;
  for(unsigned i=0;i<33;i++) if(i!=current_thread && guest_threads[i].status!=THREAD_UNUSED &&
     guest_threads[i].status!=THREAD_CREATED && guest_threads[i].status!=THREAD_EXITED) others++;
- if(!others) {kunlock();while(rt_ticks()<target) Sleep(0);return;}
+ if(!others) {
+  kunlock();
+#ifdef __linux__
+  while(rt_ticks()<target) plat_sleep_until_ns((uint64_t)(((__uint128_t)target*1000000000u+19199999)/19200000));
+#else
+  while(rt_ticks()<target) Sleep(0);
+#endif
+  return;
+ }
  guest_threads[current_thread].wake_tick=target;
  guest_threads[current_thread].status=THREAD_SLEEPING;
  (parallel_mode ? 0 : (thread_reschedule=1));
@@ -585,6 +679,7 @@ static void prof_attach(unsigned thread) {
  if((int)thread!=wanted || !GetEnvironmentVariableA("AC_PROFILE",NULL,0)) return;
  if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&prof_target,THREAD_ALL_ACCESS,FALSE,0)) return;
  {ULONG_PTR low,high;GetCurrentThreadStackLimits(&low,&high);prof_stack_low=low;prof_stack_high=high;
+#ifndef WIN32_POSIX  /* (Linux: the image is ELF; samples are recorded without their caller) */
   const uint8_t *image=(const uint8_t *)GetModuleHandleA(NULL);
   const IMAGE_NT_HEADERS64 *nt=(const IMAGE_NT_HEADERS64 *)(image+((const IMAGE_DOS_HEADER *)image)->e_lfanew);
   /* The executable sections only: data pointers on the stack are not return addresses. */
@@ -593,7 +688,9 @@ static void prof_attach(unsigned thread) {
    uint64_t lo=(uint64_t)(uintptr_t)image+sec[i].VirtualAddress,hi=lo+sec[i].Misc.VirtualSize;
    if(!prof_image_low || lo<prof_image_low) prof_image_low=lo;
    if(hi>prof_image_high) prof_image_high=hi;
-  }}
+  }
+#endif
+ }
  HANDLE t=CreateThread(NULL,0,prof_thread,NULL,0,NULL);if(t)CloseHandle(t);
  printf("PROFILE sampling the host thread of guest thread %u\n",thread);
 }

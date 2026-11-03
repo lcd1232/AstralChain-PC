@@ -84,7 +84,7 @@ static DWORD save_delete_tree(const wchar_t *directory) {
 static uint64_t save_capacity(const SaveStore *store) {uint64_t size;memcpy(&size,store->identity+40,8);return size;}
 /* Each commit is also copied, in the background, to <save>-snapshots\<date-time>\data (the newest 30 are kept):
  * checkpoints to load again later, e.g. the one just before a cutscene (tests with AC_DATA_DIR), and a backup.
- * AC_SAVE_SNAPSHOTS=0 turns this off. */
+ * Off by default; AC_SAVE_SNAPSHOTS=1 turns it on (tests). */
 static void snapshot_copy(const wchar_t *from,const wchar_t *to) {
  CreateDirectoryW(to,NULL);
  wchar_t pattern[1100];swprintf(pattern,1100,L"%ls\\*",from);
@@ -140,8 +140,8 @@ static DWORD WINAPI snapshot_thread(void *argument) {
  return 0;
 }
 static void save_snapshot(SaveStore *store) {
- static int on=-1;
- if(on<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_SAVE_SNAPSHOTS",v,sizeof(v));on=!(n && n<sizeof(v) && v[0]=='0');}
+ static int on=0;
+ SETTING_LIVE(on,"AC_SAVE_SNAPSHOTS",0);
  if(!on || !store->ready)return;
  if(InterlockedCompareExchange(&snapshot_busy,1,0))return;  /* one copy at a time */
  wcscpy(snapshot_root,store->root);

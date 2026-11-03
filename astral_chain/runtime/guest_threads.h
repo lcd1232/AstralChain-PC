@@ -298,6 +298,7 @@ static void parallel_stats(void) {
  for(unsigned t=0;t<33;t++) if(nvn_thread_calls[t])
   printf(" t%u %.0f %llu",t,1000.0*(double)nvn_thread_qpc[t]/(double)f.QuadPart,(unsigned long long)nvn_thread_calls[t]);
  memset(nvn_thread_qpc,0,sizeof(nvn_thread_qpc));memset(nvn_thread_calls,0,sizeof(nvn_thread_calls));
+ nvn_main_report((double)f.QuadPart);
  puts("");
  klock_contended=klock_contended_qpc=nvn_contended=nvn_contended_qpc=0;memset(parallel_mutex_ticks,0,sizeof(parallel_mutex_ticks));
  memset(parallel_wait_ticks,0,sizeof(parallel_wait_ticks));memset(parallel_wait_count,0,sizeof(parallel_wait_count));
@@ -343,6 +344,7 @@ static DWORD WINAPI parallel_thread_main(LPVOID parameter) {
  current_thread=i;state=guest_threads[i].cpu;  /* (initial context from svcCreateThread) */
  klock();live_cpu[i]=&state;kunlock();
  prof_attach(i);
+ cpu_place_register(i,NULL);
  guest_execute(&state);  /* returns only at the host return sentinel; guest threads end with svcExitThread */
  klock();guest_threads[i].status=THREAD_EXITED;kunlock();
  return 0;

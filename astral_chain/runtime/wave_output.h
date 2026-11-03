@@ -104,12 +104,11 @@ static MMRESULT wave_output_append(WaveOutput *output,uint64_t tag,const void *p
  /* Timing: when the queued sound runs out (play_end, QPC seconds) and whether it ran dry before this buffer. A dry
   * queue pauses the sound, which then stays behind the picture by the gap: the cutscene drift reported on a second PC
   * (the game keeps only 15-47 ms queued; its sound thread was 55-128 ms late in 140 ms frames). Gaps under 0.5 s are
-  * repaid by skipping as much of the following sound (at most 0.3 s owed; AC_AUDIO_RESYNC=0: off); longer gaps are
+  * repaid by skipping as much of the following sound (at most 0.3 s owed; always on); longer gaps are
   * the game's own pauses (loading). */
  size_t skip=0;double dump_gap=0;
  if(output->running) {
-  static int resync=1;
-  SETTING_LIVE(resync,"AC_AUDIO_RESYNC",1);
+  const int resync=1;
   LARGE_INTEGER f,q;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&q);
   double now=(double)q.QuadPart/(double)f.QuadPart;
   uint64_t played;  /* re-anchored on the device's position: the estimate alone drifts with the device clock */
@@ -163,6 +162,15 @@ static MMRESULT wave_output_append(WaveOutput *output,uint64_t tag,const void *p
  buffer->header.lpData=malloc(length);if(!buffer->header.lpData)return MMSYSERR_NOMEM;
  memcpy(buffer->header.lpData,(const uint8_t*)pcm+skip,length);buffer->header.dwBufferLength=(DWORD)length;buffer->tag=tag;
  if(app_exit_requested) memset(buffer->header.lpData,0,length);  /* (the window was closed: silent while the game exits) */
+ else {  /* AC_VOLUME=0..100 (the in-game menu's Sound tab): the player's volume on top of the game's own, 16-bit PCM */
+  static int volume=100;
+  SETTING_LIVE(volume,"AC_VOLUME",100);
+  if(volume<100) {
+   int gain=volume<0 ? 0 : volume*65536/100;
+   int16_t *s=(int16_t*)buffer->header.lpData;
+   for(size_t i=0;i<length/2;i++) s[i]=(int16_t)(((int32_t)s[i]*gain)>>16);
+  }
+ }
  MMRESULT result=wave_api.prepare(output->handle,&buffer->header,sizeof(WAVEHDR));
  if(!result)result=wave_api.write(output->handle,&buffer->header,sizeof(WAVEHDR));
  if(result) {

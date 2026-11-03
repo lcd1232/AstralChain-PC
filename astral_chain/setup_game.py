@@ -312,19 +312,9 @@ def build_romfs(inputs, base_program, base_tik, update_program, update_tik):
 
 
 # ---------------------------------------------------------------------------------------------------- 5. build
-def game_language():
-    """AC_LANGUAGE (the Linux launcher's game language): the Switch system language the build answers with; the game
-    shows its text and subtitles in it (or in English when it lacks it). None: native_trace's default."""
-    from .control_meta import LANGUAGES
-    value = os.environ.get('AC_LANGUAGE', '').strip()
-    return value if value in LANGUAGES else None
-
-
 def fingerprint():
-    """Changes to the sources, vendored code or patches make the next launch rebuild (and a chosen game language)."""
+    """Changes to the sources, vendored code or patches make the next launch rebuild."""
     digest = hashlib.sha256()
-    if game_language():
-        digest.update(f'language {game_language()}\n'.encode())
     for root in (PROJECT/'astral_chain', PROJECT/'third_party'):
         for path in sorted(root.rglob('*')):
             if path.is_file() and '__pycache__' not in path.parts and 'data' not in path.relative_to(root).parts[:1]:
@@ -358,8 +348,6 @@ def build_game():
                '--optimize', '--lean', '--direct-calls', '--jumps', '--entry-labels', '--restrict']
     for patch in PATCHES:
         command += ['--patch', patch]
-    if game_language():
-        command += ['--language', game_language()]
     command.append('--build-only')
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(PROJECT), os.environ.get('PYTHONPATH')])))
     USERDATA.mkdir(parents=True, exist_ok=True)

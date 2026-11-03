@@ -31,12 +31,52 @@ static int hot_log_on(void) {
 #ifndef SYSCALL_LIMIT
 #define SYSCALL_LIMIT 100000u
 #endif
-#ifndef APPLICATION_LANGUAGE
-#define APPLICATION_LANGUAGE 0ull
+#ifndef NACP_LANGUAGES
+#define NACP_LANGUAGES ""
 #endif
-#ifndef SYSTEM_LANGUAGE
-#define SYSTEM_LANGUAGE 0ull
-#endif
+/* The game's language (the in-game menu's Game language, AC_LANGUAGE: a code of control_meta.LANGUAGES, or auto: the
+ * host's locale, $LC_ALL / $LC_MESSAGES / $LANG), read once, at the game's first question: the Switch system language
+ * the game is told (settings GetLanguageCode), and the application language (applet GetDesiredLanguage): that one if
+ * the game has it, else US English, else its first (control.nacp, NACP_LANGUAGES). A change applies at the next start;
+ * nothing is rebuilt. */
+static uint64_t app_system_language,app_application_language;
+static char app_language_code[16];
+static int app_language_in(const char *code,const char *list) {
+ size_t n=strlen(code);
+ for(const char *p=list;*p;) {
+  const char *e=strchr(p,',');size_t len=e ? (size_t)(e-p) : strlen(p);
+  if(len==n && !strncmp(p,code,n)) return 1;
+  p+=len;if(*p) p++;
+ }
+ return 0;
+}
+static uint64_t app_language_pack(const char *code) {uint64_t v=0;memcpy(&v,code,strlen(code)<8 ? strlen(code) : 8);return v;}
+static const char *const app_known_languages="en-US,en-GB,ja,fr,de,es-419,es,it,nl,fr-CA,pt,ru,ko,zh-Hant,zh-Hans,pt-BR";
+static void app_language_auto(char *out,size_t size) {
+ const char *names[]={"LC_ALL","LC_MESSAGES","LANG"};const char *loc=NULL;
+ for(int i=0;i<3 && !loc;i++) {const char *v=getenv(names[i]);if(v && *v && strcmp(v,"C") && strcmp(v,"POSIX")) loc=v;}
+ char l[32]="";if(loc) snprintf(l,sizeof l,"%s",loc);
+ for(char *p=l;*p;p++) {if(*p=='-') *p='_';if(*p>='A' && *p<='Z') *p+=32;if(*p=='.' || *p=='@' || *p==':') {*p=0;break;}}
+ if(!strncmp(l,"zh",2)) {snprintf(out,size,"%s",strstr(l,"tw") || strstr(l,"hk") || strstr(l,"mo") || strstr(l,"hant") ? "zh-Hant" : "zh-Hans");return;}
+ static const char *const two[]={"en-US","ja","fr","de","es","it","ru","ko","nl","pt"};
+ for(unsigned i=0;i<sizeof two/sizeof *two;i++) if(l[0] && !strncmp(l,two[i],2)) {snprintf(out,size,"%s",two[i]);return;}
+ snprintf(out,size,"en-US");
+}
+static void app_languages_load(void) {
+ if(app_system_language) return;
+ char v[16]="";
+ if(!setting_get("AC_LANGUAGE",v,sizeof v) || !v[0] || !strcmp(v,"auto") || !app_language_in(v,app_known_languages))
+  app_language_auto(v,sizeof v);
+ snprintf(app_language_code,sizeof app_language_code,"%s",v);
+ const char *app=app_language_in(v,NACP_LANGUAGES) ? v : app_language_in("en-US",NACP_LANGUAGES) ? "en-US" : NULL;
+ char first[16]="";
+ if(!app && NACP_LANGUAGES[0]) {size_t n=strcspn(NACP_LANGUAGES,",");snprintf(first,sizeof first,"%.*s",(int)n,NACP_LANGUAGES);app=first;}
+ app_system_language=app_language_pack(v);
+ app_application_language=app ? app_language_pack(app) : 0;
+ printf("[app] language %s (the game's text: %s)\n",v,app ? app : "?");fflush(stdout);
+}
+/* (las/menu.cpp: the menu's language follows the game's) */
+const char *host_game_language(void) {app_languages_load();return app_language_code;}
 static __thread unsigned calls;  /* per host thread: shared counters bounced between cores in parallel mode */
 static unsigned syscalls;
 static __thread struct { uint64_t from,target; } recent_calls[64];
@@ -1053,9 +1093,8 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    unsigned handle=ipc_u32(request.arguments),index=hid_sensor_index(handle);
    if(request.command==66) hid_sensor_started[index/64]|=1ull<<(index%64);
    else hid_sensor_started[index/64]&=~(1ull<<(index%64));
-   /* Starting a subscription does not attach a sensor. Keyboard has none;
-    * its six-axis rings remain empty with no connected attributes. */
-   printf("HID sixaxis handle=0x%x started=%u (no host sensor)\n",handle,request.command==66);
+   /* The FullKey ring is filled every sample (hid_service.h hid_motion): the pad's gyro, else at rest. */
+   printf("HID sixaxis handle=0x%x started=%u\n",handle,request.command==66);
    reply_result(buffer,&request,0);c->x[0]=0;return;
   }
   if(kind==SESSION_VIBRATION_LIST && request.command==0 && request.argument_size>=4) {
@@ -1170,8 +1209,9 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    application_ensure_save(buffer,&request);c->x[0]=0;return;
   }
   if(kind==SESSION_APPLICATION_FUNCTIONS && request.command==21) {
-   if(!APPLICATION_LANGUAGE) boundary("missing-application-language-metadata",c,pc);
-   reply_wide_value(buffer,&request,APPLICATION_LANGUAGE);c->x[0]=0;return;
+   app_languages_load();
+   if(!app_application_language) boundary("missing-application-language-metadata",c,pc);
+   reply_wide_value(buffer,&request,app_application_language);c->x[0]=0;return;
   }
   if(kind==SESSION_APPLICATION_FUNCTIONS && request.command==22 && request.argument_size>=4) {
    application_terminate_result=ipc_u32(request.arguments);application_terminate_result_set=1;
@@ -1281,8 +1321,9 @@ static void rt_svc_body(Cpu*c,uint32_t imm,uint64_t pc) {
    puts("");reply_result(buffer,&request,0);c->x[0]=0;return;
   }
   if(kind==SESSION_SETTINGS && request.command==0) {
-   if(!SYSTEM_LANGUAGE) boundary("missing-system-language",c,pc);
-   reply_wide_value(buffer,&request,SYSTEM_LANGUAGE);c->x[0]=0;return;
+   app_languages_load();
+   if(!app_system_language) boundary("missing-system-language",c,pc);
+   reply_wide_value(buffer,&request,app_system_language);c->x[0]=0;return;
   }
   if(kind==SESSION_SETTINGS && (request.command==5 || request.command==6)) {
    /* System locale identifiers, independent of this game's supported languages. */

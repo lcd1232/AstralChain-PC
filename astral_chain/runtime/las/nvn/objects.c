@@ -9,6 +9,7 @@
 void renderer_sync(void);
 uint64_t renderer_wait_target(uint64_t seq);
 uint64_t renderer_fence_seq(void);
+uint64_t renderer_fence_submit(void);
 int renderer_seq_done(uint64_t seq);
 
 static uint64_t next_debug_id = 1;
@@ -144,7 +145,7 @@ static void *aq_worker(void *arg) {
         AsyncJob j = aq[aq_head % AQ_SIZE];
         pthread_mutex_unlock(&aq_lock);
         if (j.kind == AJ_EXEC) backend_execute(j.handle);
-        else if (j.kind == AJ_FENCE) j.sync->seq = renderer_fence_seq();
+        else if (j.kind == AJ_FENCE) j.sync->seq = renderer_fence_submit();
         else { backend_present_crop(j.crop); backend_present(j.tex); }
         pthread_mutex_lock(&aq_lock);
         aq_head++;
@@ -252,7 +253,7 @@ NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
     s->signaled = 1;
     if (aq_on > 0) { s->async_job = aq_push((AsyncJob){.kind = AJ_FENCE, .sync = s}); return; }
-    s->seq = renderer_fence_seq();
+    s->seq = renderer_fence_submit();
 }
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
 NVN(nvnQueueWaitSync) { RET(1); }

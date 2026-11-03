@@ -21,7 +21,7 @@
 #include "../renderer.h"
 
 VkG g_vk;
-Settings g_settings;  // all off: no SMAA, bilinear presentation, windowed
+Settings g_settings;  // no SMAA, windowed; the upscaler from the in-game menu (present_settings)
 void *nvn_host_window(void);  // runtime nvn_hle.h: the application window (HWND)
 static HWND window;
 static VkDebugUtilsMessengerEXT messenger;
@@ -453,7 +453,12 @@ bool vk_frame_begin(const float clear[4]) {
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
-    vk_wait_seq(slot_seq[slot]);
+    // AC_FRAMES_IN_FLIGHT=<1..3>: how many presented frames the GPU may still be working on when the next one starts
+    // (default 3: the acquire semaphores' rotation). (test: the Steam Deck's flashes of the UI atlas over the picture)
+    static int in_flight = -1;
+    if (in_flight < 0) { const char *e = getenv("AC_FRAMES_IN_FLIGHT"); in_flight = e ? atoi(e) : FRAMES;
+                         if (in_flight < 1 || in_flight > FRAMES) in_flight = FRAMES; }
+    vk_wait_seq(slot_seq[(slot + FRAMES - in_flight) % FRAMES]);
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
@@ -641,6 +646,33 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+// The in-game menu's Screen tab, read again after each change (game_settings.h): AC_UPSCALER = fsr (default: AMD FSR 1,
+// EASU + RCAS, when the picture's place in the window is larger than the game image) | bilinear; AC_FSR_SHARPNESS =
+// 0..100 (default 75; 0: no sharpening; RCAS at (100 - it) / 50 stops, as the TotK PC port); AC_ASPECT = fit (default:
+// the game's 16:9 with black bars) | stretch (the whole window).
+int setting_get(const char *name, char *buf, unsigned size);
+int setting_int(const char *name, int otherwise);
+unsigned settings_version(void);
+static bool g_stretch;
+float g_fsr_sharpness = 75;  // (exec.c post_process)
+static float g_render_scale = 1.0f;
+static void present_settings(void) {
+    static unsigned version = ~0u;
+    if (version == settings_version()) return;
+    version = settings_version();
+    char v[32];
+    g_settings.upscaler = setting_get("AC_UPSCALER", v, sizeof v) && !strcmp(v, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_FSR1;
+    int sharp = setting_int("AC_FSR_SHARPNESS", 75);
+    g_fsr_sharpness = (float)(sharp < 0 ? 0 : sharp > 100 ? 100 : sharp);
+    g_stretch = setting_get("AC_ASPECT", v, sizeof v) && !strcmp(v, "stretch");
+    // AC_RENDER_SCALE: the game's 16:9 targets (1600x900 and their halves, quarters...) are made this many times
+    // larger (textures.c tex_scalable); the game draws to them as if they were its own size
+    double rs = setting_get("AC_RENDER_SCALE", v, sizeof v) ? atof(v) : 1.0;
+    g_render_scale = rs >= 0.5 && rs <= 4.0 ? (float)rs : 1.0f;
+    LOG("[present] %s, sharpness %d, %s, render scale %.2f\n", g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear",
+        (int)g_fsr_sharpness, g_stretch ? "stretch" : "fit", g_render_scale);
+}
+
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
@@ -656,7 +688,8 @@ void backend_present(NvnTexture *t) {
     }
     if (have) {
         // Astral Chain: the game image fills the window at its own aspect ratio (letterboxed), rendered at the
-        // game's resolution (render scale 1). No widescreen crop, overlay menu or dynamic resolution.
+        // game's resolution times the render scale (AC_RENDER_SCALE). No widescreen crop, overlay menu or dynamic
+        // resolution.
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height, gw = t->width ? t->width : dw, gh = t->height ? t->height : dh;
         float uv[4] = {0, 0, 1, 1};
         const int *cr = g_present_crop;
@@ -667,8 +700,10 @@ void backend_present(NvnTexture *t) {
             gw = cr[2]; gh = cr[3];
         }
         memcpy(g_shot_crop, uv, sizeof uv);
+        present_settings();
         double k = dw / gw < dh / gh ? dw / gw : dh / gh, vw = gw * k, vh = gh * k, vx = (dw - vw) / 2, vy = (dh - vh) / 2;
-        renderer_set_scale(1.0f, 1.0f);
+        if (g_stretch) vw = dw, vh = dh, vx = vy = 0;
+        renderer_set_scale(g_render_scale, g_render_scale);
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, uv[0], uv[1], uv[2], uv[3]};
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);

@@ -19,7 +19,8 @@ Astral Chain changes to vendored files (keep this list current):
   separate vertex and fragment programs); LASRecomp's Link's Awakening GPU-timer
   pacing is off unless `LARECOMP_PACE=1`.
 - `nvn/vulkan/device.c`: Win32 window from the runtime (`nvn_host_window`) instead
-  of SDL; letterboxed presentation at render scale 1; uncompressed PNG writer;
+  of SDL; letterboxed presentation, render scale from `AC_RENDER_SCALE` (in-game menu,
+  Advanced); uncompressed PNG writer;
   no UI thread, menu, widescreen or test hooks; screenshots in the run directory.
 
 Vulkan backend support files: `shim/` (SDL timer/CPU count, shaderc API),

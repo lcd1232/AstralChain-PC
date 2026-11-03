@@ -235,6 +235,17 @@ static LRESULT CALLBACK app_window_proc(HWND window,UINT message,WPARAM wparam,L
 static DWORD app_window_thread;
 static void app_pump(void) {
  if(!app_window || GetCurrentThreadId()!=app_window_thread) return;
+ /* At most once a millisecond (AC_PUMP_INTERVAL_US, 0: every call): it runs at every SVC of the window's thread, many
+  * a frame, and each run polled SDL (the display connection, D-Bus for the input method, the pads) under the kernel
+  * lock: ~5% of the game's main thread on a laptop, every other guest thread stopped meanwhile. The input read
+  * (hid_poll) keeps its own 125 Hz. */
+ {
+  static int64_t interval=-1;static uint64_t last;
+  if(interval<0) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PUMP_INTERVAL_US",v,sizeof(v));interval=n && n<sizeof(v) ? atoll(v) : 1000;if(interval<0) interval=0;}
+  uint64_t now=rt_ticks();
+  if(last && now-last<(uint64_t)interval*192/10) return;   /* (rt_ticks: 19.2 MHz) */
+  last=now;
+ }
  MSG message;
  unsigned count=0;
  /* (stall reports) this runs under the kernel lock: a slow message or input read stops every guest thread. Steps over

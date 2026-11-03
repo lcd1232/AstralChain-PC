@@ -12,9 +12,32 @@
  *
  * AC_CPU_PLACEMENT=0: off (the scheduler places every thread). Off without /sys/devices/cpu_core (not a hybrid Intel
  * CPU: the Steam Deck, desktop AMD). */
-/* native_trace.py: each turn of a spin wait adds the cycles since the previous turn (when under 20000: the same wait)
+/* rt_spin_turn: each turn of a spin wait adds the cycles since the previous turn (when under 20000: the same wait)
  * to rt_spin_tsc */
-__thread unsigned long long rt_spin_tsc, rt_spin_last;
+#ifdef __linux__
+#include <sched.h>
+#endif
+__thread unsigned long long rt_spin_tsc, rt_spin_last, rt_spin_run;
+/* One turn of a spin wait. A wait longer than AC_SPIN_YIELD time stamp counter cycles (default 200000, ~60 us; 0:
+ * never) yields the core at each turn from then on: on a CPU with few cores (the Steam Deck: 4 cores, 8 threads) the
+ * waiting thread otherwise holds a core, or half of one, the thread it waits for may need. */
+void rt_spin_turn(void) {
+ static long long yield_after = -1;
+ if (yield_after < 0) { const char *e = getenv("AC_SPIN_YIELD"); yield_after = e ? atoll(e) : 200000; }
+ unsigned long long t = __builtin_ia32_rdtsc(), d = t - rt_spin_last;
+ if (d < 20000) { rt_spin_tsc += d; rt_spin_run += d; } else rt_spin_run = 0;
+ rt_spin_last = t;
+ if (yield_after > 0 && rt_spin_run > (unsigned long long)yield_after) {
+#ifdef __linux__
+  sched_yield();
+#else
+  SwitchToThread();
+#endif
+  rt_spin_last = __builtin_ia32_rdtsc();  /* (the time away is part of this wait, not a new one) */
+  return;
+ }
+ __builtin_ia32_pause();
+}
 #ifdef __linux__
 #include <pthread.h>
 #include <sys/syscall.h>

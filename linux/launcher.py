@@ -6,12 +6,13 @@ starts that program directly; nothing is compiled when the game starts. A new ve
 rebuilds the game once, keeping the game data and saves.
 
     launcher.py                 the window
-    launcher.py --play          start the game directly when it is installed and built (Steam shortcut); else the window
+    launcher.py --play          start the game directly when it is installed and built; else the window
     launcher.py --install --base B --update U --keys K [--dest D]   install without the window
     launcher.py --selftest      build the window, run the checks it can without game files, and close
 
 Settings live in $XDG_CONFIG_HOME/astral-chain-pc/config.json; the install folder holds game/, build/ and userdata/
-(saves in userdata/saves).
+(saves in userdata/saves). Add to Steam writes <install>/play.sh, which starts the game without this launcher or the
+AppImage (glslang and the icon are copied next to it), and points the Steam shortcut at it.
 """
 import argparse
 import json
@@ -19,6 +20,7 @@ import locale
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -81,14 +83,6 @@ GAME_LANGUAGES = (('en-US', 'English'), ('ja', '日本語'), ('fr', 'Français')
                   ('it', 'Italiano'), ('ru', 'Русский'), ('ko', '한국어'), ('zh-Hant', '繁體中文'), ('zh-Hans', '简体中文'))
 
 
-def system_game_language():
-    lang = SYSTEM_LOCALE.split(':')[0].split('.')[0].replace('-', '_')
-    if lang.startswith('zh'):
-        return 'zh-Hant' if lang.endswith(('_tw', '_hk', '_mo', 'hant')) else 'zh-Hans'
-    for code, _ in GAME_LANGUAGES:
-        if lang[:2] == code[:2]:
-            return code
-    return 'en-US'
 TEXT = {
     'title': ('Astral Chain PC', 'Astral Chain PC'),
     'subtitle': ('Native Linux build from your own dump', 'Нативная сборка для Linux из вашего дампа'),
@@ -130,6 +124,8 @@ TEXT = {
     'steam_done': ('Added to Steam as "Astral Chain PC". Start Steam; no Proton is needed for it.',
                    'Добавлено в Steam как «Astral Chain PC». Запустите Steam; Proton для неё не нужен.'),
     'steam_none': ('No Steam user found in ~/.local/share/Steam.', 'Профиль Steam не найден в ~/.local/share/Steam.'),
+    'steam_build': ('Install the game first, then press Add to Steam.',
+                    'Сначала установите игру, затем нажмите «Добавить в Steam».'),
     'exit_code': ('The game stopped (exit code {code}). The logs are in {folder}.',
                   'Игра остановилась (код {code}). Журналы: {folder}.'),
     'deck': ('Steam Deck detected: handheld settings are the defaults.',
@@ -203,18 +199,13 @@ OPTIONS = [
      'check', '1', '1', lambda v: {'AC_BC7_PRECOMPUTE': '1'} if v == '1' else {}),
     ('bc7', 'group_performance', ('Compress textures on the GPU (BC7: less memory traffic; short pauses while areas load)', 'Сжимать текстуры на GPU (BC7: меньше нагрузка на память; короткие паузы при загрузке зон)'),
      'check', '0', '1', lambda v: {'LARECOMP_BC7': '1'} if v == '1' else {}),
-    ('game_language', 'group_game', ('Game language (text and subtitles; the game is rebuilt once, about a minute)',
-                                     'Язык игры (текст и субтитры; игра один раз пересобирается, около минуты)'),
+    ('game_language', 'group_game', ('Game language (text and subtitles)', 'Язык игры (текст и субтитры)'),
      (('auto', 'auto'), *GAME_LANGUAGES), 'auto', 'auto',
-     lambda v: {'AC_LANGUAGE': system_game_language() if v == 'auto' else v}),
+     lambda v: {'AC_LANGUAGE': v}),   # (auto: the game follows the system's locale itself)
     ('cutscene_fps_30', 'group_game', ('Cutscenes at 30 fps, as on the Switch', 'Ролики в 30 fps, как на Switch'),
      'check', '0', '0', lambda v: {'AC_CUTSCENE_FPS': '30'} if v == '1' else {}),
     ('ignore_focus', 'group_game', ('Keep running while the window is minimized', 'Не ставить на паузу при сворачивании окна'),
      'check', '0', '1', lambda v: {'AC_IGNORE_FOCUS': '1'} if v == '1' else {}),
-    ('save_snapshots', 'group_game', ('Back up each save (the newest 30 are kept)', 'Резервная копия при каждом сохранении (хранятся 30 последних)'),
-     'check', '1', '1', lambda v: {} if v == '1' else {'AC_SAVE_SNAPSHOTS': '0'}),
-    ('audio_resync', 'group_sound', ('Skip sound gaps after a stall to stay in sync', 'Пропускать звук после подвисания, чтобы не отставал'),
-     'check', '1', '1', lambda v: {} if v == '1' else {'AC_AUDIO_RESYNC': '0'}),
     ('mouse_look', 'group_mouse', ('Mouse moves the camera (click the window to capture)', 'Мышь управляет камерой (щёлкните по окну, чтобы захватить)'),
      'check', '1', '1', lambda v: {} if v == '1' else {'AC_MOUSE_LOOK': '0'}),
     ('mouse_invert', 'group_mouse', ('Invert mouse up and down', 'Инвертировать мышь по вертикали'),
@@ -233,10 +224,10 @@ OPTIONS = [
 # menu.cpp), kept in settings.ini in the install folder (AC_SETTINGS_FILE). What the launcher had for them goes there
 # once, when there is no settings.ini yet (game_env); the launcher shows only its own and the setup's settings.
 IN_GAME = ('fullscreen', 'handheld', 'present', 'fps_limit', 'async_submit', 'bc7', 'cutscene_fps_30', 'ignore_focus',
-           'save_snapshots', 'audio_resync', 'mouse_look', 'mouse_invert', 'prompts', 'gpu_astc', 'pipe_warm')
+           'game_language', 'mouse_look', 'mouse_invert', 'prompts', 'gpu_astc', 'pipe_warm')
 GAME_OPTIONS = [o for o in OPTIONS if o[0] in IN_GAME]
 OPTIONS = [o for o in OPTIONS if o[0] not in IN_GAME]
-SETUP_KEYS = ('gpu_warm', 'gpl', 'game_language', 'bc7_prepare')   # these change what the setup builds or compiles
+SETUP_KEYS = ('gpu_warm', 'gpl', 'bc7_prepare')   # these change what the setup builds or compiles
 
 
 def default_install():
@@ -260,6 +251,11 @@ def save_config(config):
     tmp = CONFIG.with_suffix('.tmp')
     tmp.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     os.replace(tmp, CONFIG)
+    if (Path(config['install']).expanduser()/PLAY_SCRIPT).is_file():
+        try:
+            write_play_script(config)   # (the Steam shortcut's script follows the settings)
+        except OSError:
+            pass
 
 
 def option_env(config, keys=None, options=None):
@@ -316,6 +312,7 @@ def game_env(config):
                 env[name.strip()] = value.strip()
     env.update(option_env(config, options=OPTIONS))
     env['AC_SETTINGS_FILE'] = str(game_settings_file(config))
+    env['AC_VERSION'] = build_version()
     if not env.get('AC_FONT') and (font := system_font()):
         env['AC_FONT'] = font
     if not env.get('AC_PROMPT_FONT') and (font := system_font(':bold')):
@@ -323,10 +320,32 @@ def game_env(config):
     return env
 
 
+def build_version():
+    """This launcher's version for the in-game menu's header: the VERSION file the AppImage carries, else the git
+    commit of this checkout (with -dirty for local changes), else empty."""
+    try:
+        return (CODE/'VERSION').read_text(encoding='utf-8').strip()
+    except OSError:
+        pass
+    try:
+        return subprocess.run(['git', 'describe', '--always', '--dirty'], cwd=CODE, capture_output=True, text=True,
+                              timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
 def game_settings_file(config):
     """settings.ini of the in-game menu; the first time, made from what the launcher had for those settings (the Steam
     Deck's defaults included)."""
     path = Path(config['install']).expanduser()/'settings.ini'
+    language = config['settings'].get('game_language', 'auto')
+    if path.exists() and language != 'auto':
+        try:
+            text = path.read_text(encoding='utf-8')
+            if not re.search(r'^\s*AC_LANGUAGE\s*=', text, re.M):
+                path.write_text(text.rstrip('\n') + f'\nAC_LANGUAGE={language}\n', encoding='utf-8')
+        except OSError:
+            pass
     if not path.exists():
         env = option_env(config, IN_GAME, GAME_OPTIONS)
         lines = ['# Astral Chain PC settings: written by the in-game menu (F1, or Minus and Plus together)']
@@ -370,6 +389,63 @@ def run_game(config, log=print):
             return process.wait()
 
 
+PLAY_SCRIPT = 'play.sh'
+
+
+def write_play_script(config):
+    """<install>/play.sh: the game with the launcher's current settings, without the launcher or the AppImage (what the
+    Steam shortcut starts). glslang (shaders the caches do not have yet) and the icon are copied into the install folder;
+    the build's run-env.txt is read when the script runs, so a rebuild keeps it working. Rewritten whenever the settings
+    are saved. Returns its path, or None when the game is not built."""
+    home = Path(config['install']).expanduser().resolve()
+    run = home/'build'/'game'
+    round0 = run/'round-00'
+    if not (round0/'trace.exe').is_file():
+        return None
+    env = game_env(config)
+    glslang = CODE/'tools'/'glslang'/'bin'/'glslang'
+    copy = home/'tools'/'glslang'
+    if glslang.is_file():
+        source = glslang.stat()
+        if not copy.is_file() or (copy.stat().st_size, int(copy.stat().st_mtime)) != (source.st_size, int(source.st_mtime)):
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(glslang, copy.with_suffix('.tmp'))
+            os.replace(copy.with_suffix('.tmp'), copy)
+    env['AC_GLSLANG'] = str(copy)
+    icon = CODE/'linux'/'astral-chain.png'
+    if icon.is_file() and not (home/'astral-chain.png').is_file():
+        shutil.copyfile(icon, home/'astral-chain.png')
+    run_env = run/'run-env.txt'
+    from_build = set()
+    if run_env.is_file():
+        from_build = {line.split('=', 1)[0].strip() for line in run_env.read_text(encoding='utf-8').splitlines() if '=' in line}
+    # only what the launcher sets (not the environment it was started with, the AppImage's included)
+    exports = {k: v for k, v in sorted(env.items()) if os.environ.get(k) != v and k not in from_build
+               and not k.startswith('PYTHON')}
+    lines = ['#!/bin/sh',
+             '# Astral Chain PC without the launcher (the Steam shortcut): written by the launcher, rewritten when its',
+             '# settings are saved. Logs: build/game/round-00/trace.log and stderr.log.',
+             f'cd {shlex.quote(str(run))} || exit 1',
+             'if [ -f run-env.txt ]; then',
+             '    while IFS= read -r line || [ -n "$line" ]; do',
+             '        case "$line" in *=*)',
+             '            name=$(printf %s "${line%%=*}" | tr -d \' \\t\\r\')',
+             '            value=$(printf %s "${line#*=}" | sed \'s/^[[:space:]]*//; s/[[:space:]]*$//\')',
+             '            export "$name=$value" ;;',
+             '        esac',
+             '    done < run-env.txt',
+             'fi']
+    lines += [f'export {k}={shlex.quote(v)}' for k, v in exports.items()]
+    lines += [f'exec {shlex.quote(str(round0/"trace.exe"))} {shlex.quote(str(round0/"relocations.bin"))} '
+              f'>{shlex.quote(str(round0/"trace.log"))} 2>{shlex.quote(str(round0/"stderr.log"))}']
+    script = home/PLAY_SCRIPT
+    tmp = script.with_suffix('.tmp')
+    tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    tmp.chmod(0o755)
+    os.replace(tmp, script)
+    return script
+
+
 def setup_command(*args):
     return [sys.executable, '-u', '-m', 'astral_chain.setup_game', *args]
 
@@ -396,41 +472,49 @@ def steam_roots():
     return roots
 
 
-def add_to_steam():
-    """A non-Steam shortcut to this AppImage (or launcher) with --play; artwork from launcher/art. Steam must be closed
-    (it rewrites shortcuts.vdf on exit). Returns the number of Steam users updated."""
+def add_to_steam(config):
+    """A non-Steam shortcut to <install>/play.sh (the game itself: the AppImage can then be removed); artwork from
+    launcher/art. Steam must be closed (it rewrites shortcuts.vdf on exit). Returns the number of Steam users updated,
+    or None when the game is not built."""
     import struct
     import zlib
+    script = write_play_script(config)
+    if script is None:
+        return None
     users = []
     for steam in steam_roots():
         users += [p for p in (steam/'userdata').glob('*') if p.is_dir() and p.name.isdigit() and p.name != '0'
                   and p.resolve() not in [u.resolve() for u in users]]
     if not users:
         return 0
-    exe = f'"{APPIMAGE}"' if APPIMAGE else f'"{sys.executable}"'
-    options = '--play' if APPIMAGE else f'"{Path(__file__).resolve()}" --play'
+    exe = f'"{script}"'
     name = 'Astral Chain PC'
     for user in users:
-        config = user/'config'
-        config.mkdir(parents=True, exist_ok=True)
-        shortcuts = config/'shortcuts.vdf'
+        steam_config = user/'config'
+        steam_config.mkdir(parents=True, exist_ok=True)
+        shortcuts = steam_config/'shortcuts.vdf'
         root = vdf_parse(shortcuts.read_bytes()) if shortcuts.exists() else {'shortcuts': (0, {})}
         entries = root.setdefault('shortcuts', (0, {}))[1]
         entry = next((v for _, v in entries.values() if isinstance(v, dict) and v.get('AppName', (1, ''))[1] == name), None)
         appid = zlib.crc32((exe + name).encode()) | 0x80000000
+        grid = steam_config/'grid'
         if entry is None:
             entry = {}
             entries[str(max([int(k) for k in entries if k.isdigit()], default=-1) + 1)] = (0, entry)
-        icon = CODE/'linux'/'astral-chain.png'
-        for key, value in {'AppName': name, 'Exe': exe, 'StartDir': f'"{Path(exe.strip(chr(34))).parent}"',
-                           'icon': str(icon) if icon.is_file() else '', 'ShortcutPath': '', 'LaunchOptions': options}.items():
+        elif entry.get('appid', (2, b''))[0] == 2 and len(entry['appid'][1]) == 4:
+            old = struct.unpack('<I', entry['appid'][1])[0]
+            if old != appid:   # (the earlier shortcut to the AppImage: its artwork goes)
+                for suffix in ('p', '', '_hero'):
+                    (grid/f'{old}{suffix}.jpg').unlink(missing_ok=True)
+        icon = script.parent/'astral-chain.png'
+        for key, value in {'AppName': name, 'Exe': exe, 'StartDir': f'"{script.parent}"',
+                           'icon': str(icon) if icon.is_file() else '', 'ShortcutPath': '', 'LaunchOptions': ''}.items():
             entry[key] = (1, value)
         for key, value in {'appid': appid, 'IsHidden': 0, 'AllowDesktopConfig': 1, 'AllowOverlay': 1, 'OpenVR': 0,
                            'Devkit': 0}.items():
             entry[key] = (2, struct.pack('<I', value))
         entry.setdefault('LastPlayTime', (2, struct.pack('<I', 0)))
         entry.setdefault('tags', (0, {}))
-        grid = config/'grid'
         grid.mkdir(exist_ok=True)
         art = CODE/'launcher'/'art'
         for source, suffix in (('1-visor.jpg', 'p'), ('2-ark-city.jpg', ''), ('5-panorama.jpg', '_hero')):
@@ -805,9 +889,13 @@ class App:
             messagebox.showwarning(t('title'), t('steam_running'))
             return
         try:
-            count = add_to_steam()
+            self.remember()
+            count = add_to_steam(self.config)
         except (OSError, ValueError) as error:
             messagebox.showerror(t('title'), str(error))
+            return
+        if count is None:
+            messagebox.showwarning(t('title'), t('steam_build'))
             return
         messagebox.showinfo(t('title'), t('steam_done') if count else t('steam_none'))
 

@@ -252,6 +252,116 @@ void menu_key(unsigned vk,int down) __attribute__((weak));
 void menu_mouse_move(float x,float y,float client_w,float client_h) __attribute__((weak));
 void menu_mouse_button(int button,int down) __attribute__((weak));
 void menu_mouse_wheel(float steps) __attribute__((weak));
+/* ---- Six-axis sensor of the FullKey controller (Switch Pro Controller): what the game reads for the Arrow Legion's
+ * fine aiming and the balancing cases. The npad's FullKey six-axis ring follows the six button rings and their
+ * system-extension ring (npad + 0x1758; 17 slots of {sequence, state}; the device type at + 0x4188 after the six
+ * six-axis rings). Units as the Switch's: acceleration in G, angular velocity in turns per second, the angle
+ * accumulated in turns, the direction a 3x3 matrix. The pad's sensors come from SDL (posix/w32_sdl.c host_pad_motion);
+ * axes as yuzu maps SDL's onto the Switch's. AC_GYRO=0 (the menu's Gyro off), or no pad with a gyro: the controller lies
+ * still, face up. AC_GYRO_SENS: the angular velocity's scale in percent (the aim; the tilt is not scaled). */
+typedef struct {int64_t delta_time,sample;float accel[3],gyro[3],angle[3],direction[9];uint32_t attributes,reserved;} HidSixAxis;
+typedef struct {uint64_t sequence;HidSixAxis state;} HidSixAxisSlot;
+typedef struct {uint64_t unused,capacity,tail,count;HidSixAxisSlot slots[17];} HidSixAxisRing;
+_Static_assert(sizeof(HidSixAxis)==0x60,"six-axis state size");
+_Static_assert(0x1758+6*sizeof(HidSixAxisRing)==0x4188,"six-axis rings end at the device type");
+int host_pad_motion(float gyro[3],float accel[3]) __attribute__((weak));
+static void hid_motion(uint8_t *npad,uint64_t now,int connected,int focused) {
+ static uint64_t sampling,last;static float q[4]={1,0,0,0},angle[3];static int had;
+ static int on=1,sens=100;
+ SETTING_LIVE(on,"AC_GYRO",1);
+ SETTING_LIVE(sens,"AC_GYRO_SENS",100);
+ float g[3]={0,0,0},a[3]={0,0,-1};
+ float sg[3],sa[3];
+ int have=on && connected && focused && host_pad_motion && host_pad_motion(sg,sa);
+ /* The gyro's zero: what it reads while the controller is still, taken off every reading (as the Switch, Steam Input
+  * and UltraTears do). Without it a Steam Controller (2026) lying on a table turned the aim slowly upward, from an
+  * offset of a few degrees a second that differed from one start to the next. Still is told by steadiness, not by
+  * size: the gyro's mean and spread over about half a second are kept, and the controller is still once, for 0.6 s,
+  * the spread (all three axes) stays under 3 deg/s, the acceleration within 3% of its own mean (some controllers read
+  * 0.8 G at rest, not 1) and the mean under 20 deg/s, a plausible offset. The first time the zero becomes that mean at
+  * once; after that it follows it over about 4 s, and only while the mean stays within 3 deg/s of the zero, so a slow
+  * steady turn while aiming is not taken for an offset. The acceleration read at rest is also what the direction below
+  * takes for 1 G. AC_GYRO_CALIBRATE=0: off. */
+ static float bias[3],mean[3],var[3],amean,still_s,rest_g=9.80665f;static int cal=-1,bias_set,stats_set;
+ static uint64_t cal_last;
+ if(cal<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_GYRO_CALIBRATE",v,sizeof(v));cal=!(n && n<sizeof(v) && !atoi(v));}
+ if(have && cal) {
+  const float deg=0.01745329f;
+  float cdt=cal_last && now>cal_last ? (float)(now-cal_last)/19200000.0f : 0.008f;
+  if(cdt>0.05f) cdt=0.008f;   /* (a gap: unfocused, sensors off) */
+  float k=cdt/0.5f,am=sqrtf(sa[0]*sa[0]+sa[1]*sa[1]+sa[2]*sa[2]),spread=0,off=0,size=0;
+  if(!stats_set) {for(int i=0;i<3;i++) {mean[i]=sg[i];var[i]=0;} amean=am;stats_set=1;}
+  for(int i=0;i<3;i++) {
+   float d=sg[i]-mean[i];mean[i]+=k*d;var[i]+=k*(d*d-var[i]);spread+=var[i];
+   off+=(mean[i]-bias[i])*(mean[i]-bias[i]);size+=mean[i]*mean[i];
+  }
+  amean+=k*(am-amean);
+  int quiet=sqrtf(spread)<3*deg && fabsf(am-amean)<0.03f*amean && sqrtf(size)<20*deg && (!bias_set || sqrtf(off)<3*deg);
+  still_s=quiet ? still_s+cdt : 0;
+  if(still_s>=0.6f) {
+   float f=bias_set ? cdt/4.0f : 1.0f;
+   for(int i=0;i<3;i++) bias[i]+=f*(mean[i]-bias[i]);
+   if(amean>0.5f*9.80665f && amean<1.5f*9.80665f) rest_g=amean;
+   if(!bias_set) {
+    bias_set=1;
+    printf("HID six-axis: at rest, gyro zero %.2f %.2f %.2f deg/s taken off, gravity read as %.2f G (AC_GYRO_CALIBRATE=0: off)\n",
+           bias[0]/deg,bias[1]/deg,bias[2]/deg,amean/9.80665f);
+    fflush(stdout);
+   }
+  }
+  for(int i=0;i<3;i++) sg[i]-=bias[i];
+ }
+ cal_last=have ? now : 0;
+ if(have) {
+  const float turn=6.2831853f,G=9.80665f;
+  g[0]=sg[0]/turn;g[1]=-sg[2]/turn;g[2]=sg[1]/turn;          /* (yuzu's SDL mapping) */
+  a[0]=-sa[0]/G;a[1]=sa[2]/G;a[2]=-sa[1]/G;
+ }
+ if(have!=had) {printf("HID six-axis: %s\n",have ? "the pad's gyro" : "at rest");fflush(stdout);had=have;}
+ /* AC_INPUT_LOG=1: also the sensors twice a second (SDL's rad/s and m/s^2, and the Switch's turns/s and G given) */
+ {
+  static int log=-1;static uint64_t log_tick;
+  if(log<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_INPUT_LOG",v,sizeof(v));log=n && n<sizeof(v) && atoi(v);}
+  if(log && have && now-log_tick>=9600000) {
+   log_tick=now;
+   printf("HID six-axis sdl gyro %.3f %.3f %.3f (zero %.3f %.3f %.3f%s) accel %.2f %.2f %.2f -> gyro %.4f %.4f %.4f accel %.2f %.2f %.2f\n",
+          sg[0],sg[1],sg[2],bias[0],bias[1],bias[2],still_s>=0.6f ? ", still" : "",sa[0],sa[1],sa[2],g[0],g[1],g[2],a[0],a[1],a[2]);
+   fflush(stdout);
+  }
+ }
+ double dt=last ? (double)(now-last)/19200000.0 : 0.008;last=now;
+ if(dt>0.1) dt=0.1;
+ /* the direction: the angular velocity integrated (quaternion), pulled gently toward the measured gravity */
+ {
+  float w[3]={g[0]*6.2831853f,g[1]*6.2831853f,g[2]*6.2831853f};
+  float an=sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
+  if(fabsf(an*9.80665f/rest_g-1)<0.15f) {  /* (about the 1 G it reads at rest: not while the pad is shaken) */
+   float vx=2*(q[1]*q[3]-q[0]*q[2]),vy=2*(q[0]*q[1]+q[2]*q[3]),vz=q[0]*q[0]-q[1]*q[1]-q[2]*q[2]+q[3]*q[3];
+   float ax=-a[0]/an,ay=-a[1]/an,az=-a[2]/an,k=1.0f;
+   w[0]+=k*(ay*vz-az*vy);w[1]+=k*(az*vx-ax*vz);w[2]+=k*(ax*vy-ay*vx);
+  }
+  float h=(float)dt*0.5f,q0=q[0],q1=q[1],q2=q[2],q3=q[3];
+  q[0]+=h*(-q1*w[0]-q2*w[1]-q3*w[2]);q[1]+=h*(q0*w[0]+q2*w[2]-q3*w[1]);
+  q[2]+=h*(q0*w[1]-q1*w[2]+q3*w[0]);q[3]+=h*(q0*w[2]+q1*w[1]-q2*w[0]);
+  float n=sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+  for(int i=0;i<4;i++) q[i]=n>0 ? q[i]/n : (i==0);
+ }
+ float scale=(sens<10 ? 10 : sens>300 ? 300 : sens)/100.0f;
+ HidSixAxis s={0};
+ s.delta_time=(int64_t)(dt*1e9);s.sample=++sampling;
+ for(int i=0;i<3;i++) {s.accel[i]=a[i];s.gyro[i]=g[i]*scale;angle[i]+=g[i]*(float)dt;s.angle[i]=angle[i];}
+ float w0=q[0],x=q[1],y=q[2],z=q[3];
+ float m[9]={1-2*(y*y+z*z),2*(x*y-z*w0),2*(x*z+y*w0),2*(x*y+z*w0),1-2*(x*x+z*z),2*(y*z-x*w0),2*(x*z-y*w0),2*(y*z+x*w0),1-2*(x*x+y*y)};
+ memcpy(s.direction,m,sizeof m);
+ s.attributes=connected ? 1 : 0;   /* (IsConnected) */
+ HidSixAxisRing *ring=(HidSixAxisRing*)(npad+0x1758);
+ unsigned next=(unsigned)((ring->tail+1)%17);
+ ring->slots[next].state=s;
+ InterlockedExchange64((volatile LONG64*)&ring->slots[next].sequence,(LONG64)s.sample);
+ ring->capacity=17;
+ InterlockedExchange64((volatile LONG64*)&ring->tail,next);
+ if(ring->count<16) ring->count++;
+}
 int menu_pad_gate(uint64_t buttons,int32_t lx,int32_t ly) __attribute__((weak));
 static int menu_open(void) {return menu_is_open && menu_is_open();}
 static void hid_publish(uint64_t now,int focused) {
@@ -315,6 +425,7 @@ static void hid_publish(uint64_t now,int focused) {
  }
  hid_ring_write((HidRing*)(npad+0x28),&sample);
  hid_ring_write((HidRing*)(npad+0x1408),&sample);
+ hid_motion(npad,now,connected,focused && !gated);
  hid_last_tick=now;
 }
 static void hid_poll(int focused) {

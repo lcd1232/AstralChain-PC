@@ -3120,22 +3120,18 @@ static void gmem_writeback_apply(uint64_t done) {
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
     // Astral Chain: on a discrete GPU the device-local mirror. The host-pointer import made the NVIDIA driver log
-    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). On an integrated GPU the
-    // heap is imported (as the TotK port does): the GPU reads the same system memory, and the mirror was a second copy
-    // of it (2.8 GB on an Intel Arc B390) with the written pages copied in before each submission. A failed import
-    // falls back to the mirror. AC_VK_HEAP_IMPORT=1 / 0 forces either. Not on Linux by default: there the runtime's
-    // write tracking changes page protections of the heap, and on an imported (pinned) range each change made the
-    // driver (Mesa ANV on Xe) pin the pages again: the render thread spent most of its time in the kernel and an Arc
-    // B390 fell from 60 to 8-17 fps (2026-11-01).
+    // bursts of GPU faults (nvlddmkm 153) and the machine bug-checked (0x119, 2026-10-19). AC_VK_HEAP_IMPORT=1 imports
+    // the heap instead (as the TotK port does): on an integrated GPU the mirror is a second copy of the same system
+    // memory (2.8 GB). Once imported, the heap's write tracking stops (nvn_hle.h written_pages): on Linux each tracking
+    // query protects the written pages again, and on an imported (pinned) range the driver (Mesa ANV on Xe) pinned them
+    // again - most of the render thread's time in the kernel, 8-17 fps on an Arc B390. Without tracking, the texture
+    // checks hash contents and the vertices are read in place: in a busy scene on that Arc B390 (~1000 draws a frame)
+    // 30-35 fps against 48-57 with the mirror (2026-11-02), so the mirror stays the default. A failed import falls back
+    // to the mirror.
     static int import = -1;
     if (import < 0) {
         const char *e = getenv("AC_VK_HEAP_IMPORT");
-#ifdef __linux__
-        bool by_default = false;
-#else
-        bool by_default = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-#endif
-        import = g_vk.host_import && (e ? atoi(e) != 0 : by_default);
+        import = g_vk.host_import && e && atoi(e) != 0;
         LOG("[vk] guest heap for shader global memory: %s\n", import ? "imported (no copy)" : "mirrored in device memory");
     }
     if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL;
@@ -3167,6 +3163,10 @@ static VkDescriptorBufferInfo gmem_info(void) {
 // inside them use that copy, and a shader that stores gets the ranges copied back to the heap right after it (the
 // game alternates its buffer sets per frame: the CPU isn't writing them meanwhile). Accesses outside the table use
 // the heap as before. LARECOMP_VK_GMEM_FAST=0: no copy (empty table: everything goes to the heap, the old behaviour).
+// Integrated GPUs (Intel, AMD APUs, the Steam Deck) share system memory, so the heap is no farther than the copy: there
+// the copies are off by default (LARECOMP_VK_GMEM_FAST=1 turns them on). On an Intel Arc B390 (Mesa ANV) recording the
+// two copies cost ~15 ms of CPU each, and the highway chase's effects, six such dispatches a frame, ran at 5-6 fps
+// (46-56 fps without them).
 #define GFAST_SIZE (32ull << 20)
 static VkBuffer gfast_buf;
 static VmaAllocation gfast_mem;
@@ -3187,7 +3187,11 @@ static VkDescriptorBufferInfo gfast_info(void) {
 
 static void gfast_prepare(VkCommandBuffer cb) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LARECOMP_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VK_GMEM_FAST");
+        on = e ? atoi(e) != 0 : g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        LOG("[vk] compute global memory copies %s\n", on ? "on" : e ? "off (LARECOMP_VK_GMEM_FAST=0)" : "off (integrated GPU: shared memory)");
+    }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
     gmem_info();  // (the heap import, made on first use)
@@ -3431,6 +3435,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         }
     }
     if (!vc_on || !gmem_buf || size > VC_MAX_RANGE) return false;
+    if (!gmem_alloc) return false;  // (imported heap: no write tracking then, the GPU reads the vertices in place)
     uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     if (hi > gmem_size) return false;
     uint64_t pend = vk_pending_seq();

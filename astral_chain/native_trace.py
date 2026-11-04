@@ -102,7 +102,7 @@ def translate(image, reference, seeds, limit, nodes=None, *, all_text=False):
                 count=min(32,(offset-module.nso.text[0])//4+1)
                 targets=switch_targets(module,module.nso.unpack('<'+str(count)+'I',offset-(count-1)*4),pc)
                 if targets:
-                    queue.extend(targets);followed_switches.add(pc)
+                    queue.extend(targets);followed_switches.add(pc);SWITCH_TARGETS.update(targets)
             body += f'uint64_t target={op.target}; '
             if op.kind == 'blr':
                 body += f'c->x[30]={after}ull; trace_call({pc}ull,target); '
@@ -160,6 +160,8 @@ PAGE_LEAN = False
 DIRECT_PAGES = set()
 DIRECT_EXCLUDE = set()
 _BL_TAIL = re.compile(r'c->x\[30\]=(\d+)ull; c->pc=(\d+)ull; break; \}$')
+_DIRECT_TAIL = re.compile(r'c->x\[30\]=(\d+)ull; c->pc=\d+ull; page_[0-9a-f]+\(c\); break; \}$')
+DIRECT_RETURN_JUMPS = False  # (--entry-labels)
 
 
 def _direct_call(text, called):
@@ -180,8 +182,42 @@ _JUMP_TAIL = re.compile(r'c->pc=(\d+)ull; break; \}$')
 _COND_TAIL = re.compile(r'c->pc=\((.*)\) \? (\d+)ull : (\d+)ull; break; \}$')
 
 
+# Spin waits: a conditional branch back over at most SPIN_MAX instructions that only load from unchanging addresses and
+# compare - the game's spin locks and flag waits, e.g. `ldr w8, [x19]; cbnz w8, <the ldr>`. The Switch's cores spin on
+# them as they are; on a PC the spinning core takes the power budget the others need (an Intel laptop ran into its
+# power limit with one game thread spinning half of the time), and a hyper-thread sibling slows. The taken branch gets
+# a call to rt_spin_turn (runtime/cpu_placement.h): a pause instruction (the x86 spin-wait hint), the same loop, a
+# little slower to notice the change, much less power; after a long wait it yields the core to another thread. It
+# also adds its time to rt_spin_tsc: runtime/cpu_placement.h tells a thread that waits from one that works.
+# A loop that moves a pointer or counts (a string scan, a search) is no wait and keeps its speed: the body may hold
+# only loads without write-back whose base register the loop does not write, and compares that set flags only.
+SPIN_MAX = 4
+_SPIN_LOAD = re.compile(r'^\{ \{ uint64_t ea = c->x\[(\d+)\](?: \+ 0x[0-9a-f]+ull)?; uint64_t v = LD(?:8|16|32|64)\(ea\); '
+                        r'c->x\[(\d+)\] = \(uint64_t\)\(v\); \} \}$')
+_SPIN_COMPARE = re.compile(r'^\{ (?:\(void\)\((?:subs|adds|ands)(?:32|64)\(c, [^;]*\)\);'
+                           r'|if \(COND_\w+\(c\)\) \(void\)(?:subs|adds)(?:32|64)\(c, [^;]*\); else c->nzcv = 0x[0-9a-f]+ull;) \}$')
+
+
+def _spin_wait(by_pc, at, target):
+    if not (0 < at - target <= 4 * SPIN_MAX):
+        return False
+    bases, written, loads = set(), set(), 0
+    for pc in range(target, at, 4):
+        text = by_pc.get(pc)
+        if text is None:
+            return False
+        body = re.sub(r'^(?:L_[0-9a-f]+: )?case \d+ull: ', '', text).strip()
+        m = _SPIN_LOAD.match(body)
+        if m:
+            bases.add(m.group(1)); written.add(m.group(2)); loads += 1
+        elif not _SPIN_COMPARE.match(body):
+            return False
+    return loads > 0 and not bases & written
+
+
 def _local_jumps(cases, page):
     labels = {int(t[5:t.index('ull')]) for t in cases}
+    by_pc = {int(t[5:t.index('ull')]): t for t in cases}
     used, out = set(), []
     def go(target):
         if target in labels:
@@ -191,30 +227,133 @@ def _local_jumps(cases, page):
     for text in cases:
         m = _COND_TAIL.search(text)
         if m and (int(m.group(2)) in labels or int(m.group(3)) in labels):
-            text = text[:m.start()] + f'if ({m.group(1)}) {{ {go(int(m.group(2)))} }} {go(int(m.group(3)))} }}'
+            at, taken = int(text[5:text.index('ull')]), int(m.group(2))
+            pause = '{ extern void rt_spin_turn(void); rt_spin_turn(); } ' if _spin_wait(by_pc, at, taken) else ''
+            text = text[:m.start()] + f'if ({m.group(1)}) {{ {pause}{go(taken)} }} {go(int(m.group(3)))} }}'
         else:
             m = _JUMP_TAIL.search(text)
             if m and int(m.group(1)) in labels:
                 text = text[:m.start()] + go(int(m.group(1))) + ' }'
+            else:
+                # a direct call to a page function: back at the return address in this page (the usual case), go on
+                # there instead of through the page's switch (an indirect jump)
+                m = _DIRECT_TAIL.search(text)
+                if m and DIRECT_RETURN_JUMPS and int(m.group(1)) in labels:
+                    back = int(m.group(1))
+                    used.add(back)
+                    text = text[:m.end() - len('break; }')] + f'if (c->pc=={back}ull) goto L_{back:x}; break; }}'
         out.append(text)
     return [(f'L_{int(t[5:t.index("ull")]):x}: ' if int(t[5:t.index('ull')]) in used else '') + t for t in out]
+
+
+# Entry labels (--entry-labels, lean builds with --jumps): every translated instruction used to be a case of its
+# page's switch, a place execution may enter from the dispatcher, so the compiler had to keep the whole guest state in
+# memory at each instruction: guest registers and flags were stored and loaded again around every one. Execution
+# only enters a page at a target of a branch or call from another page, a return address, a code pointer of the
+# relocations, or (from a loop's back edge) a loop head; those keep their case, the other instructions only their
+# goto label or none, so the compiler optimizes across the straight-line code between them. Anything else (a code
+# pointer the analysis missed: one computed with adrp/add, a thread entry) runs in the page's fallback function, which
+# has a case for every instruction, is not optimized (fast to compile) and returns as soon as execution reaches an
+# entry: the next loop head, call or branch at the latest.
+PAGE_ENTRIES = None
+SWITCH_TARGETS = set()  # (translate: the jump tables' targets, entered through the switch after a br)
+_CONST_PC = re.compile(r'c->pc=(\d+)ull')
+_COND_PCS = re.compile(r'\? (\d+)ull : (\d+)ull')
+_RETURN_PC = re.compile(r'c->x\[30\]=(\d+)ull')
+
+
+def entry_points(pages, code_pointers=()):
+    entries = set(code_pointers)
+    for page, cases in pages.items():
+        for text in cases:
+            pc = int(text[5:text.index('ull')])
+            returns = _RETURN_PC.findall(text)
+            entries.update(int(t) for t in returns)
+            targets = [int(t) for t in _CONST_PC.findall(text)]
+            if returns:  # a call: its target is entered through the switch even in this page (direct page calls)
+                entries.update(targets)
+            for a, b in _COND_PCS.findall(text):
+                targets += [int(a), int(b)]
+            entries.update(t for t in targets if t >> 12 != page or t <= pc)
+            # after an unconditional jump (b, br, ret): reached by jumping only, often from a jump table the analysis
+            # did not recognize (a switch's cases follow each other); already where a block starts
+            if text.endswith('break; }') and (pc + 4) not in targets and ('c->pc=target' in text or 'c->pc=c->x[' in text
+                                                                         or (_CONST_PC.findall(text) and '?' not in text)):
+                entries.add(pc + 4)
+    return entries
+
+
+def code_pointer_targets(image):
+    """Where the relocations point (RELATIVE: base + addend; symbol relocations: the symbol + addend) and every
+    symbol's address: virtual calls, imports through the GOT, callbacks."""
+    out = {address for address, _ in image.symbols.values()}
+    out |= SWITCH_TARGETS
+    for module in image.modules:
+        for address, kind, symbol, addend in module.nso.relocs:
+            if kind == 1027:  # R_AARCH64_RELATIVE
+                out.add(module.base + addend)
+            elif symbol:
+                name, info, section, value, _ = module.nso.syms[symbol]
+                if section and section != 0xfff1:
+                    out.add(module.base + value + addend)
+                elif name in image.symbols:
+                    out.add(image.symbols[name][0] + addend)
+    return out
+
+
+def _fallback_page(page, raw):
+    """Every non-entry instruction as a case, unchained; returns when execution reaches an entry or leaves."""
+    cases = [t for t in raw if int(t[5:t.index('ull')]) not in PAGE_ENTRIES]
+    if not cases:
+        return '', False
+    return ('static __attribute__((noinline, optnone, cold)) int page_%x_fallback(Cpu *c) {\nint ran = 0;\n'
+            '{ void rt_fallback_note(uint64_t); rt_fallback_note(c->pc); }\n'
+            'while((c->pc>>12)==%dull) {\nswitch(c->pc) {\n%s\ndefault: return ran;\n}\nran = 1;\n}\nreturn ran;\n}\n'
+            % (page, page, '\n'.join(cases))), True
+
+
+# Vector lane writes (`ins v0.s[1], v1.s[0]`, `mov v0.d[1], x8`, `ld1 {v0.h}[3], ...`) come out as a store of one element
+# into the register file in memory: `((sa32 *)&c->v[0])[1] = ...;`. The game builds its vectors that way and then
+# stores or uses the whole register, and a 16-byte read of what narrow stores just wrote cannot be forwarded from them:
+# the CPU waits for the stores to retire (store forwarding stall, ~15 cycles on an Intel Core Ultra; a busy scene's
+# hottest page stalled at one). The write becomes a whole-register update: load, insert (vpinsrd/q/w), store, which
+# also lets consecutive inserts stay in one register. The empty asm stops LLVM folding it back into the narrow store.
+_LANE_WRITE = re.compile(r'\(\(sa(16|32|64) \*\)&c->v\[(\d+)\]\)\[(\d+)\] = ([^;]*);')
+
+
+def _lane_write(m):
+    bits, reg, lane, value = m.group(1), m.group(2), m.group(3), m.group(4)
+    return (f'{{ typedef int{bits}_t _vl __attribute__((vector_size(16), may_alias)); _vl _l = *(_vl *)&c->v[{reg}]; '
+            f'_l[{lane}] = (int{bits}_t)({value}); __asm__("" : "+x"(_l)); *(_vl *)&c->v[{reg}] = _l; }}')
 
 
 def emit_page(page,cases,limit,stop_at=None,external=False,chain=False):
     if PAGE_LEAN and stop_at is None:
         cases=[re.sub(r'trace_call\([^;]*\); ','',text) for text in cases]
+        cases=[_LANE_WRITE.sub(_lane_write,text) for text in cases]
         called=set()
         if DIRECT_PAGES and external:  # (cached builds: page functions are external symbols)
             cases=[_direct_call(text,called) for text in cases]
+        fallback, has_fallback = '', False
         if PAGE_JUMPS:
             cases=sorted(cases,key=lambda text:int(text[5:text.index('ull')]))
+            raw=list(cases)
             if chain: cases=chain_cases(cases)
             cases=_local_jumps(cases,page)
             chain=False  # (already chained)
+            if PAGE_ENTRIES is not None:
+                fallback, has_fallback = _fallback_page(page, raw)
+                cases=[re.sub(r'case \d+ull: ','',t,count=1) if int(t[t.index('case ')+5:t.index('ull')]) not in PAGE_ENTRIES else t
+                       for t in cases]
         protos=''.join(f'void page_{p:x}(Cpu*);\n' for p in sorted(called - {page}))
-        parts=[f'{protos}{"" if external else "static "}__attribute__((noinline)) void page_{page:x}(Cpu *{PAGE_RESTRICT}c) {{\nwhile((c->pc>>12)=={page}ull) {{\nswitch(c->pc) {{']
+        if fallback:  # (it may call its own page directly)
+            protos+=f'{"" if external else "static "}void page_{page:x}(Cpu*);\n'
+        parts=[f'{protos}{fallback}{"" if external else "static "}__attribute__((noinline)) void page_{page:x}(Cpu *{PAGE_RESTRICT}c) {{\nwhile((c->pc>>12)=={page}ull) {{\nswitch(c->pc) {{']
         parts.extend(cases if PAGE_JUMPS else chain_cases(cases) if chain else sorted(cases))  # (--jumps: ordered and chained above)
-        parts.append('default: boundary("untranslated",c,c->pc);\n} } }')
+        if has_fallback:
+            parts.append(f'default: if(!page_{page:x}_fallback(c)) boundary("untranslated",c,c->pc);\n}} }} }}')
+        else:
+            parts.append('default: boundary("untranslated",c,c->pc);\n} } }')
         return '\n'.join(parts)
     return emit_page_counted(page,cases,limit,stop_at,external,chain)
 
@@ -353,6 +492,7 @@ def main():
     parser.add_argument('--control',type=Path,help='Extracted control.nacp for supported application languages')
     parser.add_argument('--romfs',type=Path,help='Raw decrypted RomFS image, opened read-only by the host')
     parser.add_argument('--restrict',action='store_true',help="Declare page functions' Cpu pointer restrict (performance)")
+    parser.add_argument('--entry-labels',action='store_true',help='Lean --jumps builds: switch cases only at entries, a fallback function per page for the rest; a direct call goes on at its return address (performance)')
     parser.add_argument('--lean',action='store_true',help='No step counter, checkpoints or call trace in translated code (forces AC_PARALLEL)')
     parser.add_argument('--direct-calls',action='store_true',help='With --lean: BL to a translated page calls its function directly')
     parser.add_argument('--jumps',action='store_true',help='With --lean: branches within a page jump to their case directly')
@@ -504,6 +644,12 @@ if(BCryptGenRandom(NULL,(PUCHAR)entropy,sizeof(entropy),BCRYPT_USE_SYSTEM_PREFER
         nodes={} if args.dispatch=='blocks' else None
         print('  Translating the game code',flush=True)
         pages, translation = translate(image, reference, seeds, args.instructions,nodes,all_text=args.seed_all_text)
+        if args.lean and args.jumps and args.entry_labels:
+            from . import native_trace as imported
+            code_pointers = code_pointer_targets(image)
+            imported.PAGE_ENTRIES = entry_points(pages, code_pointers)
+            imported.DIRECT_RETURN_JUMPS = True
+            print(f'Entry labels: {len(imported.PAGE_ENTRIES)} entries for {translation["translated_instructions"]} instructions', flush=True)
         if args.lean and args.direct_calls:
             from . import native_trace as imported
             imported.DIRECT_PAGES = set(pages)

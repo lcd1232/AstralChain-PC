@@ -12,19 +12,24 @@ static __thread struct { Cpu *owner; uint64_t address,low,high; unsigned width; 
 static void rt_clear_pair_monitor(Cpu *c) {
  if(pair_monitor.owner==c) pair_monitor.valid=0;
 }
+/* The last region an exclusive pair was checked in (per host thread): query() scans every mapping, and the game's
+ * 128-bit atomics (ldaxp/stlxp) run often enough in its job system to show in a profile. A region unmapped since only
+ * loses this diagnostic: the access itself still faults. */
+static __thread uint64_t pair_region_base,pair_region_size;
+static int pair_cx16_checked;
 static void pair_memory(uint64_t address,unsigned width) {
  unsigned bytes=width/4;
+ if(!(address&(bytes-1)) && address-pair_region_base<pair_region_size && bytes<=pair_region_size-(address-pair_region_base) &&
+    (width!=64 || pair_cx16_checked)) return;
  Region r=query(address);
  if((address&(bytes-1)) || r.permission!=3 || bytes>r.size-(address-r.base))
   boundary("exclusive-pair-memory",&state,state.pc);
- if(width==64) {
-  static int checked;
-  if(!checked) {
-   int features[4];__cpuid(features,1);
-   if(!(features[2]&(1<<13))) boundary("host-needs-cmpxchg16b",&state,state.pc);
-   checked=1;
-  }
+ if(width==64 && !pair_cx16_checked) {
+  int features[4];__cpuid(features,1);
+  if(!(features[2]&(1<<13))) boundary("host-needs-cmpxchg16b",&state,state.pc);
+  pair_cx16_checked=1;
  }
+ pair_region_base=r.base;pair_region_size=r.size;
 }
 static void rt_load_pair(Cpu *c,uint64_t address,unsigned width,unsigned first,unsigned second) {
  pair_memory(address,width);

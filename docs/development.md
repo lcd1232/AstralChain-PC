@@ -9,7 +9,7 @@
   --compiler tools\zig\zig.exe --output build\<new folder> --instructions 4000000 --sample-steps 0 `
   --run-timeout 86400 --unbounded --chain --follow 0 --entry rtld:start --seed-all-text --build cached `
   --control game\control.nacp --romfs game\romfs.bin --nvn-hle --nvn-backend vulkan `
-  --optimize --lean --direct-calls --jumps `
+  --optimize --lean --direct-calls --jumps --entry-labels --restrict `
   --patch third_party\AstralChain-Dynamic-FPS\1.0.1.pchtxt --patch astral_chain\patches\cutscene-catchup-1.0.1.pchtxt `
   --build-only
 powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 300 -Env "AC_PARALLEL=1"
@@ -21,6 +21,15 @@ powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 3
 - Each build writes `run-env.txt`, holding addresses that move with `main`'s size, and `run_guarded.ps1` reads
   it.
 - Always run through `run_guarded.ps1`.
+- `--entry-labels`: a page function's switch has a case only where execution can enter from outside (branch and
+  call targets from other pages, return addresses, code pointers of the relocations and symbols, jump-table
+  targets, loop heads, the instruction after an unconditional jump), so the compiler optimizes across the code
+  between them; each page also gets an unoptimized fallback function with every instruction, for an entry the
+  analysis missed, which returns at the next entry. `AC_FALLBACK_LOG=1` prints the most frequent fallback entries.
+  With `--restrict` (the Cpu pointer does not alias guest memory), a busy scene's main thread took 11.1 ms a frame
+  instead of 13.3 (`linux/benchmark.py`, 2026-11-02). The executable is about twice as large.
+- `linux/benchmark.py`: a repeatable frame-rate run from a frozen save (`--capture-save` first); prints each busy
+  thread's CPU milliseconds a frame. `--variants`/`--env` compare settings.
 
 ## Unattended test runs
 
@@ -63,6 +72,7 @@ powershell -File astral_chain\run_guarded.ps1 -Run build\<new folder> -Seconds 3
 | `LARECOMP_SKIP_UNBUILT=1` | Skip draws whose pipeline is still compiling, instead of waiting for it |
 | `LARECOMP_TEX_FULLHASH=1` | Hash every texture fully at each check (slow; rules change detection in or out) |
 | `AC_ASYNC_SUBMIT=0` (on by default) | (launcher: *Prepare graphics on a separate thread*) Queue submissions, fences and presents to a worker thread that runs the Vulkan backend (`objects.c`); other NVN calls wait for the queue unless `nvn_async_safe`. The profile line counts the waits (`async drains`, `fence waits`) |
+| `AC_CPU_PLACEMENT=0` (on by default, Linux) | On hybrid Intel CPUs (`/sys/devices/cpu_core`), once a second the busiest guest threads and the render worker (CPU time less spin-wait time, which `native_trace.py` adds to `rt_spin_tsc`) run on the performance cores, every other registered thread on the efficiency cores (`cpu_placement.h`; 40 to 52 fps in a busy scene on a Core Ultra X7 358H). `AC_CPU_PLACEMENT_LOG=1` prints each thread's work every second |
 | `LARECOMP_VK_WW_BATCH=0` | One write tracking query per texture check, as before the batched checks (`exec.c` `ww_written_pages`); the profile line's `write watch` part counts the queries by caller |
 | `AC_GPU_HANG_MS=<ms>` | GPU hang stop threshold (default 1200) |
 | `LARECOMP_DUMP_TEX=<min width>` | Level-0 data of up to 24 textures (as uploaded, unswizzled) to `tex_*.bin` in the run folder |

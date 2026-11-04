@@ -52,6 +52,7 @@ static volatile DWORD klock_owner;
 static unsigned klock_depth;
 static uint64_t klock_contended,klock_contended_qpc;  /* (updated under the lock) */
 static uint64_t nvn_contended,nvn_contended_qpc;  /* (nvn_hle.h nvn_lock; parallel stats) */
+static void nvn_main_report(double qpc_hz);  /* (nvn_hle.h: the main thread's slowest NVN calls; parallel stats) */
 static uint64_t nvn_thread_qpc[33],nvn_thread_calls[33];  /* host time in NVN calls per guest thread (parallel stats) */
 /* (stall reports) the guest thread holding the lock for a supervisor call, and the call; the sound thread */
 static volatile unsigned klock_holder=99,klock_holder_svc;
@@ -405,6 +406,7 @@ static void close_library_applet(void) {
 #include "hid_service.h"
 #include "time_service.h"
 #include "app_window.h"
+#include "cpu_placement.h"
 #include "guest_threads.h"
 #include "controller_applet.h"
 #include "swkbd_applet.h"
@@ -465,6 +467,36 @@ static unsigned test_stall_ms;  /* (AC_CUTSCENE_STALL) slept after the kernel lo
 /* svc #0xB3 (movie-sync-1.0.1.pchtxt): a movie's frame clock ran this frame (the replaced mov x19, x0 is done here);
  * nvn_present_pace presents at 30 FPS while that happens. No kernel state: no lock. */
 unsigned movie_present_mark;
+/* Entry labels (native_trace.py): an entry the analysis missed runs in its page's unoptimized fallback function.
+ * AC_FALLBACK_LOG=1: the most frequent such addresses every 5 s (to add them as entries). */
+#define FALLBACK_SLOTS 4096
+static struct {uint64_t pc,count;} fallback_seen[FALLBACK_SLOTS];
+static uint64_t fallback_total,fallback_printed;
+void rt_fallback_note(uint64_t pc) {
+ static int on=-1;
+ if(on<0) on=GetEnvironmentVariableA("AC_FALLBACK_LOG",NULL,0)!=0;
+ __atomic_fetch_add(&fallback_total,1,__ATOMIC_RELAXED);
+ if(!on) return;
+ unsigned h=(unsigned)((pc>>2)*2654435761u)%FALLBACK_SLOTS;
+ for(unsigned i=0;i<16;i++,h=(h+1)%FALLBACK_SLOTS) {
+  if(fallback_seen[h].pc==pc) {__atomic_fetch_add(&fallback_seen[h].count,1,__ATOMIC_RELAXED);break;}
+  uint64_t zero=0;
+  if(!fallback_seen[h].pc && __atomic_compare_exchange_n(&fallback_seen[h].pc,&zero,pc,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {fallback_seen[h].count=1;break;}
+ }
+ uint64_t now=GetTickCount64();
+ if(now-fallback_printed<5000) return;
+ fallback_printed=now;
+ printf("FALLBACK %llu entries; top:",(unsigned long long)fallback_total);
+ for(int k=0;k<15;k++) {
+  unsigned best=0;uint64_t most=0;
+  for(unsigned i=0;i<FALLBACK_SLOTS;i++) if(fallback_seen[i].count>most) {most=fallback_seen[i].count;best=i;}
+  if(!most) break;
+  printf(" 0x%llx:%llu",(unsigned long long)fallback_seen[best].pc,(unsigned long long)most);
+  fallback_seen[best].count=0;
+ }
+ printf("\n");
+ for(unsigned i=0;i<FALLBACK_SLOTS;i++) fallback_seen[i].count=0;
+}
 void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
  if(imm==0xB3) {extern unsigned nvn_present_count;c->x[19]=c->x[0];movie_present_mark=nvn_present_count;return;}
  if(!parallel_mode) {rt_svc_body(c,imm,pc);return;}

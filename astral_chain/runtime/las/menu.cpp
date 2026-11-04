@@ -6,7 +6,7 @@
 // over more frames than are in flight.
 //
 // Tabs of rows over game_settings.h (each row a setting, AC_* / LARECOMP_*), in the TotK port's look: L / R or Q / E
-// switch the tabs. Text in English or Russian (AC_LANGUAGE), in the system font (AC_FONT; without it ImGui's own,
+// switch the tabs. Text in English or Russian (AC_MENU_LANGUAGE, after the game language), in the system font (AC_FONT; without it ImGui's own,
 // English only).
 #include <atomic>
 #include <math.h>
@@ -20,6 +20,7 @@
 #include "imgui_internal.h"   // SetKeyOwner, SetFocusID, SetNavCursorVisible
 #include "backends/imgui_impl_vulkan.h"
 #include "menu.h"
+#include "menu_cjk_font.h"
 
 extern "C" {
 // game_settings.h (host runtime)
@@ -173,52 +174,90 @@ static void pad_events(ImGuiIO &io, int reset) {
 // Copyright (c) 2026 Peiikai): rows on the left, the selected (controller) or hovered (mouse) row's description on the
 // right; A or a click steps a row (toggle, next value), left and right step it; a row marks its default value, says
 // "after restart" when the setting is read at the start, and is greyed out when an environment variable fixes it.
-enum Kind { CHECK, CHOICE, NUMBER, FULLSCREEN, NOTE };
+enum Kind { CHECK, CHOICE, NUMBER, FULLSCREEN, NOTE, GROUP };
 struct Row {
     Kind kind;
     const char *key;
-    const char *en, *ru;            // label (NOTE: the text)
+    const char *en, *ru;            // label (NOTE: the text; GROUP: the heading)
     const char *desc_en, *desc_ru;  // the description pane
     const char *def;                // value when the setting is not set
     bool live;                      // applies at once (else after a restart)
     const char *values;             // CHOICE: "value|English|Russian;..."; NUMBER: "low;high;step;suffix"; CHECK: the on value
     bool presence;                  // CHECK read by the setting's presence (LARECOMP_NO_PIPE_WARM): on = not set
+    const char *dep_key, *dep_off;  // greyed out while setting dep_key has the value dep_off ...
+    const char *why_en, *why_ru;    // ... with this in the description
 };
+static const char kGameLanguages[] =
+    "auto|Automatic (system)|Авто (как в системе);en-US|English|English;ja|日本語|日本語;fr|Français|Français;"
+    "de|Deutsch|Deutsch;es|Español|Español;it|Italiano|Italiano;ru|Русский|Русский;ko|한국어|한국어;"
+    "zh-Hant|繁體中文|繁體中文;zh-Hans|简体中文|简体中文";
 static const Row display_rows[] = {
     {FULLSCREEN, "AC_FULLSCREEN", "Fullscreen", "Полноэкранный режим",
      "Fills the screen with the game; F11 or Alt+Enter switch it too. The game also starts this way.",
      "Игра на весь экран; F11 или Alt+Enter тоже переключают. Игра и запускается так же.", "0", true},
-    {CHOICE, "AC_FPS_LIMIT", "Frame rate limit", "Ограничение частоты кадров",
-     "The highest frame rate. Lower limits give steadier frames on slow machines (40 on the Steam Deck); the game "
-     "runs at its normal speed at any of them.",
-     "Наибольшая частота кадров. Ниже — ровнее на слабых машинах (40 на Steam Deck); скорость игры от этого не "
-     "меняется.", "60", true,
-     "60|60 fps|60 fps;50|50 fps|50 fps;45|45 fps|45 fps;40|40 fps|40 fps;30|30 fps|30 fps"},
-    {CHECK, "AC_HANDHELD", "Handheld mode", "Портативный режим",
-     "The game thinks it runs out of the dock and renders at 1280x720 instead of 1600x900: faster on weak GPUs.",
-     "Игра считает, что Switch вынут из док-станции, и рисует в 1280x720 вместо 1600x900: быстрее на слабых "
-     "видеокартах.", "0", false},
+    {CHOICE, "AC_WINDOW_SIZE", "Window size", "Размер окна",
+     "Size of the game window when not fullscreen. The window can still be resized with the mouse.",
+     "Размер окна игры вне полноэкранного режима. Окно по-прежнему можно тянуть мышью.", "1600x900", true,
+     "1280x720|1280 × 720|1280 × 720;1600x900|1600 × 900|1600 × 900;1920x1080|1920 × 1080|1920 × 1080;"
+     "2560x1440|2560 × 1440|2560 × 1440;3200x1800|3200 × 1800|3200 × 1800;3840x2160|3840 × 2160|3840 × 2160",
+     false, "AC_FULLSCREEN", "1", "Only in a window: switch Fullscreen off.",
+     "Только в окне: выключите полноэкранный режим."},
     {CHOICE, "LARECOMP_VK_PRESENT", "Presentation", "Режим вывода",
      "Mailbox: no tearing and little delay. FIFO: classic V-Sync. Immediate: no waiting, may tear.",
      "Mailbox: без разрывов и с малой задержкой. FIFO: обычная вертикальная синхронизация. Immediate: без ожидания, "
      "возможны разрывы.", "mailbox", false,
      "mailbox|Mailbox|Mailbox;fifo|FIFO (V-Sync)|FIFO (V-Sync);immediate|Immediate|Immediate"},
+    {GROUP, NULL, "Picture", "Картинка"},
+    {CHOICE, "AC_UPSCALER", "Scaling to the window", "Масштабирование под окно",
+     "How the picture is scaled when the window is larger than the game's resolution. AMD FSR 1 keeps edges and "
+     "detail sharp; bilinear is softer.",
+     "Как картинка растягивается, когда окно больше разрешения игры. AMD FSR 1 сохраняет чёткими края и детали; "
+     "билинейное — мягче.", "fsr", true,
+     "fsr|AMD FSR 1|AMD FSR 1;bilinear|Bilinear|Билинейное"},
+    {NUMBER, "AC_FSR_SHARPNESS", "FSR sharpness", "Резкость FSR",
+     "Sharpening after the FSR upscale; 0: none. Applies only when FSR scales the picture up.",
+     "Повышение резкости после масштабирования FSR; 0 — без него. Действует, только когда FSR увеличивает картинку.",
+     "75", true, "0;100;5; %", false, "AC_UPSCALER", "bilinear", "Only with AMD FSR 1 scaling.",
+     "Только при масштабировании AMD FSR 1."},
+    {CHOICE, "AC_ASPECT", "Picture shape", "Форма картинки",
+     "When the window's shape is not 16:9 (a 16:10 Steam Deck screen, a 21:9 monitor): keep the picture's shape "
+     "with black bars, or stretch it over the whole window.",
+     "Когда форма окна не 16:9 (экран Steam Deck 16:10, монитор 21:9): сохранить форму картинки с чёрными "
+     "полосами или растянуть её на всё окно.", "fit", true,
+     "fit|Black bars|Чёрные полосы;stretch|Stretch|Растянуть"},
 };
 static const Row game_rows[] = {
-    {CHECK, "AC_CUTSCENE_FPS", "Cutscenes at 30 fps", "Ролики в 30 fps",
-     "Cutscenes run at 30 fps, as on the Switch. Off: at the game's frame rate.",
-     "Ролики на движке идут в 30 fps, как на Switch. Выкл: с частотой кадров игры.", "0", true, "30"},
+    {CHOICE, "AC_FPS_LIMIT", "Frame rate limit", "Ограничение частоты кадров",
+     "The highest frame rate. Lower limits give steadier frames on slow machines (40 on the Steam Deck); the game "
+     "runs at its normal speed at any of them.",
+     "Наибольшая частота кадров. Ниже — ровнее на слабых машинах (40 на Steam Deck); скорость игры от этого не "
+     "меняется.", "60", true,
+     "30|30 fps|30 fps;40|40 fps|40 fps;45|45 fps|45 fps;50|50 fps|50 fps;60|60 fps|60 fps"},
+    {CHOICE, "AC_LANGUAGE", "Game language", "Язык игры",
+     "The language of the game's text and subtitles, as the Switch's system language would choose it. No rebuild: "
+     "the game starts in it next time.",
+     "Язык текста и субтитров игры — как его выбрал бы системный язык Switch. Без пересборки: игра запустится на "
+     "нём в следующий раз.", "auto", false, kGameLanguages},
+    {CHOICE, "AC_HANDHELD", "Console mode", "Режим консоли",
+     "Whether the game thinks the Switch is in its dock or in the hand. Docked, it draws at 1600 × 900; handheld, at "
+     "1280 × 720: faster on weak GPUs. Changes at once, as when the Switch leaves or enters its dock.",
+     "Игра считает, что Switch в док-станции или в руках. В док-станции она рисует в 1600 × 900, в портативном "
+     "режиме — в 1280 × 720: быстрее на слабых видеокартах. Меняется сразу, как при извлечении Switch из "
+     "док-станции.", "0", true,
+     "0|Docked (1600 × 900)|Док-станция (1600 × 900);1|Handheld (1280 × 720)|Портативный (1280 × 720)"},
+    {CHOICE, "AC_MENU_LANGUAGE", "Menu language", "Язык меню",
+     "The language of this menu. \"As the game\" follows the game language (Russian for Russian, English for the "
+     "others).",
+     "Язык этого меню. «Как у игры» — по языку игры (русский для русского, английский для остальных).", "game", true,
+     "game|As the game|Как у игры;en|English|English;ru|Русский|Русский"},
     {CHECK, "AC_IGNORE_FOCUS", "Keep running when minimized", "Не ставить на паузу при сворачивании",
      "Off: the game pauses while its window is minimized, as the Switch does in the HOME menu.",
      "Выкл: игра встаёт на паузу, пока окно свёрнуто, как Switch в меню HOME.", "0", true},
-    {CHECK, "AC_SAVE_SNAPSHOTS", "Back up each save", "Резервная копия сохранений",
-     "A copy of the save folder after each save; the newest 30 are kept, next to the saves.",
-     "Копия папки сохранений после каждого сохранения; хранятся 30 последних, рядом с сохранениями.", "1", true},
 };
 static const Row sound_rows[] = {
-    {CHECK, "AC_AUDIO_RESYNC", "Catch up after a stall", "Догонять звук после подвисания",
-     "After a stall (loading, a shader compiled) the sound skips the gap instead of staying behind the picture.",
-     "После подвисания (загрузка, компиляция шейдера) звук пропускает паузу, а не отстаёт от картинки.", "1", true},
+    {NUMBER, "AC_VOLUME", "Volume", "Громкость",
+     "Master volume of the game, on top of its own sound settings.",
+     "Общая громкость игры, поверх её собственных настроек звука.", "100", true, "0;100;5; %"},
 };
 static const Row controls_rows[] = {
     {CHOICE, "AC_PROMPTS", "Button icons", "Значки кнопок",
@@ -238,9 +277,34 @@ static const Row controls_rows[] = {
      "How fast the camera follows the mouse.", "Как быстро камера следует за мышью.", "100", true, "10;500;10; %"},
     {CHECK, "AC_MOUSE_INVERT", "Invert mouse up and down", "Инвертировать мышь по вертикали",
      "Moving the mouse forward looks down.", "Мышь от себя — камера смотрит вниз.", "0", true},
+    {GROUP, NULL, "Motion", "Движение"},
+    {CHECK, "AC_GYRO", "Gyro", "Гироскоп",
+     "The controller's gyro and accelerometer reach the game, as a Switch Pro Controller's: fine aiming with the "
+     "Arrow Legion (hold L) and the balancing side cases. Steam Deck, DualSense, DualShock 4 and Switch Pro "
+     "controllers have one.",
+     "Гироскоп и акселерометр контроллера передаются игре, как у Switch Pro Controller: точное прицеливание "
+     "Arrow Legion (зажать L) и побочные задания с балансом. Есть у Steam Deck, DualSense, DualShock 4 и Switch Pro.",
+     "1", true},
+    {NUMBER, "AC_GYRO_SENS", "Gyro sensitivity", "Чувствительность гироскопа",
+     "How far the aim moves for a turn of the controller.",
+     "Насколько сдвигается прицел при повороте контроллера.", "100", true, "10;300;10; %", false,
+     "AC_GYRO", "0", "Only with the gyro on.", "Только при включённом гироскопе."},
     {NOTE, NULL, "Keys are set in the launcher (Controls).", "Клавиши настраиваются в лаунчере (Управление)."},
 };
 static const Row advanced_rows[] = {
+    {CHOICE, "AC_RENDER_SCALE", "Render resolution", "Разрешение рендера",
+     "The resolution the game draws its 3D picture at (on the Switch: 1600 × 900). Higher is sharper and needs a "
+     "faster GPU and more video memory. The menus and the HUD are drawn at it too.",
+     "Разрешение, в котором игра рисует 3D-картинку (на Switch: 1600 × 900). Выше — чётче, но нужна более мощная "
+     "видеокарта и больше видеопамяти. Меню и интерфейс тоже рисуются в нём.",
+     "1", true,
+     "1|1600 × 900 (Switch)|1600 × 900 (Switch);1.2|1920 × 1080|1920 × 1080;1.6|2560 × 1440|2560 × 1440;"
+     "2|3200 × 1800|3200 × 1800;2.4|3840 × 2160|3840 × 2160"},
+    {CHECK, "AC_CUTSCENE_FPS", "In-engine cutscenes at 30 fps", "Катсцены на движке в 30 fps",
+     "Cutscenes the game draws itself run at 30 fps with a fixed step, as on the Switch. Off: at the game's frame "
+     "rate (60). Video cutscenes are always 30 fps.",
+     "Катсцены, которые игра рисует сама, идут в 30 fps с фиксированным шагом, как на Switch. Выкл: с частотой "
+     "кадров игры (60). Видеоролики всегда идут в 30 fps.", "0", true, "30"},
     {CHECK, "AC_ASYNC_SUBMIT", "Graphics on a separate thread", "Графика в отдельном потоке",
      "Prepares the graphics on a thread of its own, while the game goes on with the next frame.",
      "Готовит графику в отдельном потоке, пока игра готовит следующий кадр.", "1", false},
@@ -268,7 +332,7 @@ enum { PAGES = sizeof pages / sizeof pages[0] };
 
 static bool g_ru;
 static bool g_dirty;          // changed since the last save
-static int g_quit_armed;      // "Quit game" pressed once: the next press quits
+static bool g_close_popup;    // the menu was opened again: a quit question left open goes
 static int g_tab, g_tab_request = -1;
 static bool g_focus_first;    // the page's first row takes the cursor (opening, switching tabs)
 static int g_focus_page = -1; // ... of this page, when it is next drawn (a new tab shows a frame later)
@@ -324,10 +388,11 @@ static const ImU32 kGrey = IM_COL32(110, 110, 102, 255);
 static float g_scale = 1;
 static char g_hover[512], g_focus[512], g_first[512], g_shown[512];   // description texts
 
-static void desc_set(char *d, const Row &r, bool off) {
+static void desc_set(char *d, const Row &r, int off) {
     int n = snprintf(d, 512, "%s", tr(r.desc_en, r.desc_ru));
     if (n < 0 || n >= 512) return;
-    if (off) snprintf(d + n, 512 - n, "\n\n%s %s", tr("Set by the environment variable", "Задано переменной окружения"), r.key);
+    if (off == 1) snprintf(d + n, 512 - n, "\n\n%s %s", tr("Set by the environment variable", "Задано переменной окружения"), r.key);
+    else if (off == 2 && r.why_en) snprintf(d + n, 512 - n, "\n\n%s", tr(r.why_en, r.why_ru));
     else if (!r.live) snprintf(d + n, 512 - n, "\n\n%s", tr("Applies after the game is restarted.", "Вступит в силу после перезапуска игры."));
 }
 
@@ -335,7 +400,7 @@ struct RowView { const char *value; bool is_default, arrows; };
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right)
 // or 0; always 0 for a row the environment fixes.
-static int row_widget(const Row &r, const RowView &v, bool off) {
+static int row_widget(const Row &r, const RowView &v, int off) {
     ImGui::PushID(r.key);
     ImVec2 p = ImGui::GetCursorScreenPos();
     float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = floorf(fs * 2.2f);
@@ -398,7 +463,8 @@ static int row_widget(const Row &r, const RowView &v, bool off) {
     }
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
     dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : IM_COL32(240, 236, 224, 255), tr(r.en, r.ru), NULL, 0, &clip);
-    const char *note = off ? tr("set by the environment", "задано переменной окружения")
+    const char *note = off == 1 ? tr("set by the environment", "задано переменной окружения")
+                     : off ? NULL
                      : !r.live ? tr("after restart", "после перезапуска") : NULL;
     if (note) dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : kDim, note);
     ImGui::PopID();
@@ -406,7 +472,24 @@ static int row_widget(const Row &r, const RowView &v, bool off) {
 }
 
 // A row of the table: its value shown, a step applied.
+// Another row's setting, for a dependency (dep_key): its current value (the fullscreen state from the host).
+static const Row *find_row(const char *key);
+static bool dep_off(const Row &r) {
+    if (!r.dep_key) return false;
+    if (!strcmp(r.dep_key, "AC_FULLSCREEN")) return host_menu_fullscreen(-1) == atoi(r.dep_off);
+    const Row *d = find_row(r.dep_key);
+    char v[64];
+    if (d) current(*d, v, sizeof v);
+    else if (!setting_get(r.dep_key, v, sizeof v)) v[0] = 0;
+    return !strcmp(v, r.dep_off);
+}
+
 static void draw_row(const Row &r) {
+    if (r.kind == GROUP) {
+        ImGui::Dummy(ImVec2(0, 2 * g_scale));
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(r.en, r.ru));
+        return;
+    }
     if (r.kind == NOTE) {
         ImGui::Dummy(ImVec2(0, 4 * g_scale));
         ImGui::PushTextWrapPos(0);
@@ -414,7 +497,7 @@ static void draw_row(const Row &r) {
         ImGui::PopTextWrapPos();
         return;
     }
-    bool off = setting_fixed(r.key) != 0;
+    int off = setting_fixed(r.key) ? 1 : dep_off(r) ? 2 : 0;
     char v[64], shown[96] = "";
     current(r, v, sizeof v);
     RowView view = {shown, false, false};
@@ -469,6 +552,13 @@ static void draw_row(const Row &r) {
     }
     case NOTE: break;
     }
+}
+
+static const Row *find_row(const char *key) {
+    for (const Page &pg : pages)
+        for (int i = 0; i < pg.n; i++)
+            if (pg.rows[i].key && !strcmp(pg.rows[i].key, key)) return &pg.rows[i];
+    return NULL;
 }
 
 static void page(const Page &pg, float bottom) {
@@ -567,7 +657,8 @@ static bool vk_up(const MenuTarget *t) {
     return true;
 }
 
-// The system font (AC_FONT) at 26 px per 1080 lines, Latin and Cyrillic; ImGui's own font without it.
+// The system font (AC_FONT) at 26 px per 1080 lines, Latin and Cyrillic (ImGui's own font without it), and merged into it
+// the CJK glyphs of the game languages' names (menu_cjk_font.h).
 static bool fonts_up(float scale) {
     static const ImWchar ranges[] = {0x0020, 0x00FF, 0x0400, 0x04FF, 0x2010, 0x203A, 0x2190, 0x2193, 0x2212, 0x2212, 0};
     ImFontAtlas *fa = ImGui::GetIO().Fonts;
@@ -586,6 +677,18 @@ static bool fonts_up(float scale) {
         fc.SizePixels = 13.0f * 2 * scale;
         fa->AddFontDefault(&fc);
     }
+    {   // the Japanese, Korean and Chinese names of the game languages (menu_cjk_font.h), merged into it
+        static ImVector<ImWchar> cjk;
+        if (cjk.empty()) {
+            ImFontGlyphRangesBuilder b;
+            b.AddText(kMenuCjkText);
+            b.BuildRanges(&cjk);
+        }
+        ImFontConfig mc;
+        mc.MergeMode = true;
+        mc.FontDataOwnedByAtlas = false;   // (static data)
+        fa->AddFontFromMemoryTTF((void *)kMenuCjkFont, (int)sizeof kMenuCjkFont, 26.0f * scale, &mc, cjk.Data);
+    }
     bool ok = ImGui_ImplVulkan_CreateFontsTexture();
     printf("[menu] font %s at %.0f px%s\n", g_has_font ? path : "(ImGui's own)", 26.0f * scale, ok ? "" : ": upload failed");
     g_font_scale = ok ? scale : 0;
@@ -600,12 +703,22 @@ static void layout(const MenuTarget *t, float scale) {
     ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
     ImGui::Begin("##menu", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    if (g_close_popup) {   // (the menu was opened again: a quit question left open goes; none open: nothing to close)
+        if (ImGui::GetCurrentContext()->OpenPopupStack.Size > 0) ImGui::ClosePopupToLevel(0, false);
+        g_close_popup = false;
+    }
+    bool asking = ImGui::IsPopupOpen("##quitask");
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Settings", "Настройки"));
-    const char *hint = tr("Astral Chain PC  ·  F1 or − and + close", "Astral Chain PC  ·  F1 или − и + закрывают");
-    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(hint).x);
-    ImGui::TextDisabled("%s", hint);
+    // the build and the game's version, as the TotK port (AC_VERSION: the launcher's)
+    char version[160];
+    const char *build = getenv("AC_VERSION");
+    snprintf(version, sizeof version, tr("Astral Chain PC%s%s, game 1.0.1", "Astral Chain PC%s%s, игра 1.0.1"),
+             build && *build ? " " : "", build && *build ? build : "");
+    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
+    ImGui::TextDisabled("%s", version);
 
-    int step = ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
+    int step = asking ? 0
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1 : 0;
     if (step) g_tab_request = (g_tab + step + PAGES) % PAGES;
     if (g_tab_request >= 0) g_focus_page = g_tab_request;
@@ -635,20 +748,51 @@ static void layout(const MenuTarget *t, float scale) {
     // bottom row: the buttons on the right
     ImGui::Spacing();
     float y = ImGui::GetCursorPosY();
-    const char *cont = tr("Continue", "Продолжить");
-    char quit[96];   // (one id for both texts: a new id lost the cursor, and the confirmation reset at once)
-    snprintf(quit, sizeof quit, "%s###quit", g_quit_armed ? tr("Quit? Press again", "Выйти? Ещё раз") : tr("Quit game", "Выйти из игры"));
-    float bw = fmaxf(fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(tr("Quit? Press again", "Выйти? Ещё раз")).x),
-                     ImGui::CalcTextSize(tr("Quit game", "Выйти из игры")).x) + st.FramePadding.x * 4;
+    const char *cont = tr("Continue", "Продолжить"), *quit = tr("Quit game", "Выйти из игры");
+    float bw = fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
     ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - st.WindowPadding.x - bw * 2 - st.ItemSpacing.x, y));
     if (ImGui::Button(cont, ImVec2(bw, 0))) set_open(0);
     ImGui::SameLine();
-    if (ImGui::Button(quit, ImVec2(bw, 0))) {
-        if (g_quit_armed) { settings_save(); g_dirty = false; host_menu_quit(); set_open(0); }
-        else g_quit_armed = 1;
+    if (ImGui::Button(quit, ImVec2(bw, 0))) ImGui::OpenPopup("##quitask");
+
+    // "Quit the game?": over the menu; Cancel has the cursor, B / Esc cancel too
+    ImVec2 c(ImGui::GetWindowPos().x + ImGui::GetWindowWidth() * 0.5f, ImGui::GetWindowPos().y + ImGui::GetWindowHeight() * 0.5f);
+    ImGui::SetNextWindowPos(c, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(32 * g_scale, 26 * g_scale));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.13f, 0.11f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0, 0, 0, 0.45f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.23f, 0.29f, 0.25f, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10 * g_scale);
+    if (ImGui::BeginPopupModal("##quitask", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Quit the game?", "Выйти из игры?"));
+        ImGui::Spacing();
+        ImGui::TextUnformatted(tr("Progress since the last save will be lost.",
+                                  "Прогресс после последнего сохранения будет потерян."));
+        ImGui::Dummy(ImVec2(0, 10 * g_scale));
+        const char *no = tr("Cancel", "Отмена"), *yes = tr("Quit", "Выйти");
+        float pw = fmaxf(ImGui::CalcTextSize(no).x, ImGui::CalcTextSize(yes).x) + st.FramePadding.x * 4;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + fmaxf(0, ImGui::GetContentRegionAvail().x - pw * 2 - st.ItemSpacing.x));
+        if (ImGui::IsWindowAppearing()) { ImGui::SetKeyboardFocusHere(); ImGui::SetNavCursorVisible(true); }
+        if (ImGui::Button(no, ImVec2(pw, 0))) ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button(yes, ImVec2(pw, 0))) {
+            settings_save();
+            g_dirty = false;
+            host_menu_quit();
+            ImGui::CloseCurrentPopup();
+            set_open(0);
+        }
+        if (!ImGui::IsWindowAppearing() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
-    if (!ImGui::IsItemFocused() && !ImGui::IsItemHovered()) g_quit_armed = 0;
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) set_open(0);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(3);
+    if (!asking && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+        set_open(0);
     ImGui::End();
 }
 
@@ -667,8 +811,6 @@ extern "C" int menu_overlay_frame(const MenuTarget *t) {
         io.BackendPlatformName = "astral_chain_menu";
         style_init(g_base_style);
         ImGui::GetStyle() = g_base_style;
-        const char *lang = getenv("AC_LANGUAGE");
-        g_ru = lang && !strncmp(lang, "ru", 2);
         g_ctx = true;
     }
     float scale = menu_scale(t->height);
@@ -677,6 +819,11 @@ extern "C" int menu_overlay_frame(const MenuTarget *t) {
         g_failed.store(1);
         set_open(0);
         return 0;
+    }
+    {   // AC_MENU_LANGUAGE: game (the game's language: Russian for Russian, else English), en or ru; read every frame
+        char m[16] = "";
+        setting_get("AC_MENU_LANGUAGE", m, sizeof m);
+        g_ru = !strcmp(m, "ru") || ((!m[0] || !strcmp(m, "game")) && !strncmp(host_game_language(), "ru", 2));
     }
     if (!g_has_font) g_ru = false;   // (ImGui's own font has no Cyrillic)
     if (g_style_scale != scale) {
@@ -689,7 +836,7 @@ extern "C" int menu_overlay_frame(const MenuTarget *t) {
     if (reset) {
         io.ClearInputKeys();
         io.ClearInputMouse();
-        g_quit_armed = 0;
+        g_close_popup = true;
         g_last = 0;
         g_focus_page = g_tab;
         g_shown[0] = 0;

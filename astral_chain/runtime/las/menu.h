@@ -46,6 +46,7 @@ void menu_overlay_draw(VkCommandBuffer cb);
 /* ---- what the menu asks of the host (app_window.h) */
 int host_menu_fullscreen(int on);  /* -1: only ask; 0 / 1: windowed / fullscreen. Returns the state. */
 void host_menu_quit(void);         /* as the window's close button */
+const char *host_game_language(void);  /* the game's language code ("ru", "en-US", ...): host_runtime.c.in */
 
 #ifdef __cplusplus
 }

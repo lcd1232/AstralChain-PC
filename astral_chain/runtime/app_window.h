@@ -44,7 +44,8 @@ static void app_set_focus(unsigned focus) {
  if(app_focus!=focus) {app_focus=focus;app_enqueue(15);printf("WINDOW focus=%u\n",focus);fflush(stdout);}
 }
 /* AC_HANDHELD=1: the game is told it runs handheld (operation mode 0, normal performance mode), as on a Switch out of
- * its dock: it then renders at its handheld resolution, 1280x720, instead of the docked 1600x900. */
+ * its dock: it then renders at its handheld resolution, 1280x720, instead of the docked 1600x900. The in-game menu
+ * changes it while the game runs (nvn_hle.h nvn_present_pace: app_set_modes, the dock's messages). */
 static void app_modes_load(void) {
  static int done;char v[4];
  if(done) return;
@@ -96,6 +97,30 @@ static void app_set_fullscreen(HWND window,int on) {
  }
  app_fullscreen=on;
  printf("[app] %s\n",on ? "fullscreen" : "windowed");
+}
+/* AC_WINDOW_SIZE=<w>x<h> (the in-game menu's Window size; default 1600x900): the window's client size when not
+ * fullscreen, at the start (nvn_host_window) and when the menu changes it. */
+static int app_window_size_get(int *w,int *h) {
+ char v[32];int x=0,y=0;
+ if(!setting_get("AC_WINDOW_SIZE",v,sizeof v) || sscanf(v,"%dx%d",&x,&y)!=2 || x<640 || y<360 || x>7680 || y>4320) {x=1600;y=900;}
+ *w=x;*h=y;return 1;
+}
+static void app_window_size_apply(HWND window) {
+ int w,h;app_window_size_get(&w,&h);
+ RECT r={0,0,w,h};AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
+ SetWindowPos(window,NULL,0,0,r.right-r.left,r.bottom-r.top,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+ printf("[app] window %dx%d\n",w,h);
+}
+static void app_window_size_live(void) {
+ static unsigned version=~0u;static char last[32];static int seen,pending;
+ if(!app_window) return;
+ if(version!=settings_version()) {
+  version=settings_version();
+  char v[32]="";setting_get("AC_WINDOW_SIZE",v,sizeof v);
+  if(seen && strcmp(v,last)) pending=1;   /* (the first look: the start already used it) */
+  seen=1;strcpy(last,v);
+ }
+ if(pending && !app_fullscreen) {pending=0;app_window_size_apply(app_window);}   /* (in fullscreen: when it ends) */
 }
 /* The cursor over the window hides after 3 s without moving (playing with a controller) and shows again when the mouse
  * moves; not while the menu is open. */
@@ -244,6 +269,7 @@ static void app_pump(void) {
  if(open && app_cursor_idle) {app_cursor_idle=0;SetCursor(LoadCursorW(NULL,MAKEINTRESOURCEW(32512)));}
  LONG fullscreen=InterlockedExchange(&app_menu_fullscreen,-1);
  if(fullscreen>=0) app_set_fullscreen(app_window,(int)fullscreen);
+ app_window_size_live();
  if(InterlockedExchange(&app_menu_quit,0)) app_window_proc(app_window,WM_CLOSE,0,0);
  QueryPerformanceCounter(&a);
  hid_poll(app_input_focus && app_focus==1 && !app_exit_requested);

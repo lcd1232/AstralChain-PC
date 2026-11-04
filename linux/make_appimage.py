@@ -279,6 +279,9 @@ def make_appdir(appdir, caches, dl):
         elif source.is_file():
             shutil.copyfile(source, appdir/item)
     shutil.copytree(ROOT/'launcher'/'art', appdir/'launcher'/'art')
+    # (the in-game menu's header: launcher.py build_version; the AppImage has no .git)
+    version = subprocess.run(['git', 'describe', '--always', '--dirty'], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    (appdir/'VERSION').write_text((version or 'dev') + '\n')
     print('== tools', flush=True)
     make_tools(appdir/'tools', caches, dl)
     build_tk_xft(appdir/'python', appdir/'tools', caches, dl)

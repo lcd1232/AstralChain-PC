@@ -19,12 +19,21 @@
 /* ------------------------------------------------------------------------------------------------ SDL start */
 static pthread_mutex_t sdl_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_InitFlags sdl_flags;
+/* Started from Steam with Steam Input, the game gets Steam's virtual pad, and Steam hides the physical controllers behind
+ * it (SDL_GAMECONTROLLER_IGNORE_DEVICES); the virtual pad has no gyro. The hidden ones are opened anyway, for their
+ * motion sensors only (host_pad_motion): buttons, sticks and vibration stay the virtual pad's, as Steam maps them. */
+static char steam_hidden[4096];
 
 int w32_sdl_ensure(unsigned flags) {
  pthread_mutex_lock(&sdl_lock);
  int ok = 1;
  if ((sdl_flags & flags) != flags) {
   if (!sdl_flags) {
+   const char *hidden = getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES");
+   if (hidden && *hidden && getenv("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD")) {
+    snprintf(steam_hidden, sizeof steam_hidden, ",%s,", hidden);
+    SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, "", SDL_HINT_OVERRIDE);
+   }
    SDL_SetHint(SDL_HINT_APP_NAME, "Astral Chain");
    SDL_SetHint(SDL_HINT_APP_ID, "astral-chain");
    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
@@ -621,10 +630,21 @@ int win32_posix_vulkan_surface(HWND window, struct VkInstance_T *instance, uint6
 
 /* ------------------------------------------------------------------------------------------------ gamepads */
 static SDL_Gamepad *pads[4];
+static bool pad_motion_only[4];   /* (a controller Steam hides behind its virtual pad: see steam_hidden) */
 static pthread_mutex_t pad_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static bool steam_hides(SDL_Gamepad *g) {
+ char id[32];
+ snprintf(id, sizeof id, ",0x%04x/0x%04x,", SDL_GetGamepadVendor(g), SDL_GetGamepadProduct(g));
+ /* (Steam's virtual pad reports the IDs of the controller behind it: it is the one with a Steam Input handle and not
+  * opened through HIDAPI, so its path is not a /dev/hidraw device) */
+ const char *path = SDL_GetGamepadPath(g);
+ return steam_hidden[0] && SDL_strcasestr(steam_hidden, id) && !SDL_GetGamepadSteamHandle(g)
+        && path && !strncmp(path, "/dev/hidraw", 11);
+}
+
 static void pads_refresh_locked(void) {
- for (int i = 0; i < 4; i++) if (pads[i] && !SDL_GamepadConnected(pads[i])) { SDL_CloseGamepad(pads[i]); pads[i] = NULL; }
+ for (int i = 0; i < 4; i++) if (pads[i] && !SDL_GamepadConnected(pads[i])) { SDL_CloseGamepad(pads[i]); pads[i] = NULL; pad_motion_only[i] = false; }
  int n = 0;
  SDL_JoystickID *ids = SDL_GetGamepads(&n);
  for (int k = 0; ids && k < n; k++) {
@@ -633,7 +653,11 @@ static void pads_refresh_locked(void) {
   if (known) continue;
   for (int i = 0; i < 4; i++) if (!pads[i]) {
    pads[i] = SDL_OpenGamepad(ids[k]);
-   if (pads[i]) fprintf(stderr, "[host] gamepad %d: %s\n", i, SDL_GetGamepadName(pads[i]));
+   pad_motion_only[i] = pads[i] && steam_hides(pads[i]);
+   const char *path = pads[i] ? SDL_GetGamepadPath(pads[i]) : NULL;
+   if (pads[i]) fprintf(stderr, "[host] gamepad %d: %s (%04x/%04x %s)%s\n", i, SDL_GetGamepadName(pads[i]),
+                        SDL_GetGamepadVendor(pads[i]), SDL_GetGamepadProduct(pads[i]), path ? path : "",
+                        pad_motion_only[i] ? " (behind Steam's virtual pad: its motion sensors only)" : "");
    break;
   }
  }
@@ -650,6 +674,13 @@ typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX
 typedef struct { DWORD dwPacketNumber; XPad Gamepad; } XState;
 typedef struct { WORD wLeftMotorSpeed, wRightMotorSpeed; } XVibration;
 
+/* The pad index's buttons and sticks: none for a controller Steam hides, while a pad not hidden is open (Steam's
+ * virtual pad; with Steam Input off for the game, there is none, and the controller is read as it is) */
+static SDL_Gamepad *pad_input(DWORD index) {
+ if (!pad_motion_only[index]) return pads[index];
+ for (int i = 0; i < 4; i++) if (pads[i] && !pad_motion_only[i]) return NULL;
+ return pads[index];
+}
 static SHORT flip(Sint16 v) { return v == -32768 ? 32767 : (SHORT)-v; }
 
 static DWORD WINAPI XInputGetState(DWORD index, XState *state) {
@@ -660,7 +691,7 @@ static DWORD WINAPI XInputGetState(DWORD index, XState *state) {
  if (!(sdl_flags & SDL_INIT_VIDEO)) SDL_UpdateGamepads();   /* no window pumping events yet */
  uint64_t now = GetTickCount64();
  if (now - last_refresh > 1000) { last_refresh = now; pads_refresh_locked(); }
- SDL_Gamepad *g = pads[index];
+ SDL_Gamepad *g = pad_input(index);
  if (!g) { pthread_mutex_unlock(&pad_lock); return 1167; }
  static const struct { SDL_GamepadButton b; WORD bit; } map[] = {
   {SDL_GAMEPAD_BUTTON_DPAD_UP, 0x0001}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x0002}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x0004},
@@ -685,10 +716,53 @@ static DWORD WINAPI XInputGetState(DWORD index, XState *state) {
  state->Gamepad = p;
  return ERROR_SUCCESS;
 }
+/* The gyro and accelerometer of the first pad that has both (hid_service.h hid_motion: the FullKey controller's six-axis
+ * sensor): SDL's units, rad/s and m/s^2, SDL's axes (x right, y up, z toward the player). 0: no such pad. */
+int host_pad_motion(float gyro[3], float accel[3]) {
+ if (!(sdl_flags & SDL_INIT_GAMEPAD)) return 0;
+ int found = 0;
+ pthread_mutex_lock(&pad_lock);
+ for (int i = 0; i < 4 && !found; i++) {
+  SDL_Gamepad *g = pads[i];
+  if (!g || !SDL_GamepadHasSensor(g, SDL_SENSOR_GYRO) || !SDL_GamepadHasSensor(g, SDL_SENSOR_ACCEL)) continue;
+  if (!SDL_GamepadSensorEnabled(g, SDL_SENSOR_GYRO)) {
+   SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_GYRO, true);
+   SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_ACCEL, true);
+   fprintf(stderr, "[host] gamepad %d: gyro and accelerometer on\n", i);
+  }
+  found = SDL_GetGamepadSensorData(g, SDL_SENSOR_GYRO, gyro, 3) && SDL_GetGamepadSensorData(g, SDL_SENSOR_ACCEL, accel, 3);
+  /* Stuck sensors: a Steam Controller (2026) behind Steam's virtual pad at times stopped reporting them (one reading
+   * at the start, then the same values, exactly, for minutes; the controller itself went on sending them). A live
+   * sensor always moves a little: readings exactly the same for a second turn the sensors off and on again, and after
+   * three tries the pad is closed (the next pad refresh opens it again). */
+  if (found) {
+   static float last[6];
+   static uint64_t same_since;
+   static int tries;
+   uint64_t now = GetTickCount64();
+   float cur[6] = {gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]};
+   if (memcmp(cur, last, sizeof cur)) { memcpy(last, cur, sizeof cur); same_since = now; tries = 0; }
+   else if (now - same_since > 1000) {
+    same_since = now;
+    if (++tries <= 3) {
+     fprintf(stderr, "[host] gamepad %d: motion sensors stuck, turning them off and on (%d)\n", i, tries);
+     SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_GYRO, false); SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_ACCEL, false);
+     SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_GYRO, true); SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_ACCEL, true);
+    } else {
+     fprintf(stderr, "[host] gamepad %d: motion sensors still stuck, reopening the pad\n", i);
+     SDL_CloseGamepad(g); pads[i] = NULL; pad_motion_only[i] = false; tries = 0;
+     found = 0;
+    }
+   }
+  }
+ }
+ pthread_mutex_unlock(&pad_lock);
+ return found;
+}
 static DWORD WINAPI XInputSetState(DWORD index, XVibration *vibration) {
  if (index >= 4 || !vibration) return ERROR_INVALID_PARAMETER;
  pthread_mutex_lock(&pad_lock);
- SDL_Gamepad *g = pads[index];
+ SDL_Gamepad *g = pad_input(index);
  if (g) SDL_RumbleGamepad(g, vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed, 1000);
  pthread_mutex_unlock(&pad_lock);
  return g ? ERROR_SUCCESS : 1167;

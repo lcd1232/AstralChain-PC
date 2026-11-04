@@ -539,6 +539,17 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// A fence: the work before it is submitted now, as the game's nvnQueueFlush would do on the hardware (ours does nothing)
+// before anything waits for it. Without it, a wait on a fence of work not submitted yet was cut short at what had been
+// submitted (renderer_wait_target), and the game went on to reuse memory that work still read: single frames of the UI
+// atlas over the picture (Steam Deck, an Intel laptop). LARECOMP_FENCE_SUBMIT=0: the old behaviour.
+uint64_t renderer_fence_submit(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_FENCE_SUBMIT"); on = !e || atoi(e) != 0; }
+    if (on) renderer_submit();
+    return renderer_fence_seq();
+}
+
 // Astral Chain: cooperative waits. The submission a fence wait needs (capped at what has been submitted, as
 // renderer_wait_seq does), and whether the GPU has finished it; nvn_hle.h parks only the waiting guest thread.
 uint64_t renderer_wait_target(uint64_t seq) {
@@ -4879,10 +4890,15 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
         VkImageView ei[3] = {v};
         post_pass(cb, "easu.frag", ei, 1, e, pe, false);
-        float pr[8] = {exp2f(-0.2f), 0, 0, 0, (float)ow, (float)oh};  // (sharpness 0.2 stops: AMD's default)
-        VkImageView ri_[3] = {post_view(e)};
-        post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
-        v = post_view(r);
+        extern float g_fsr_sharpness;  // (device.c present_settings: 0..100, 0 = no RCAS)
+        if (g_fsr_sharpness > 0) {
+            float pr[8] = {exp2f(-(100 - g_fsr_sharpness) / 50.0f), 0, 0, 0, (float)ow, (float)oh};
+            VkImageView ri_[3] = {post_view(e)};
+            post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
+            v = post_view(r);
+        } else {
+            v = post_view(e);
+        }
     }
     vk_full_barrier(cb);
     vk_frame_resume();
@@ -5159,7 +5175,8 @@ static void exec_list(uint64_t handle, int depth) {
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
-            if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
+            uint64_t fence = renderer_fence_submit();
+            if (r->x[1]) nvn_sync_set_seq(r->x[1], fence);
             break;
         }
         case CMD_RESET_COUNTER:

@@ -1,5 +1,4 @@
-/* Captured legacy OpenAudioOut contract; additional stream commands remain
- * explicit boundaries. Slot addresses stay stable for the Windows callback. */
+/* Captured legacy OpenAudioOut contract; IAudioOut's commands 0-13 (switchbrew); others stop with their number. Slot addresses stay stable for the Windows callback. */
 #include "wave_output.h"
 /* dropped: tags of buffers lost when an invalidated host device was reopened; reported released next. */
 static struct { unsigned active; WaveOutput wave; uint64_t dropped[32]; unsigned ndropped; } audio_outputs[16];
@@ -101,7 +100,43 @@ static void audout_stream_dispatch(unsigned session,uint8_t *buffer,const IpcReq
   if(result) {printf("AUDOUT start result=%u\n",result);boundary("audout-host-start",&state,state.pc);}
   puts("AUDOUT started");reply_result(buffer,request,0);return;
  }
- if(request->command!=4) boundary("audout-stream-command",&state,state.pc);
+ /* The rest of IAudioOut (switchbrew): a change of the host's sound device (headphones connected) had the game stop
+  * at a command it sends then. The volume is kept, not applied (the host mixer has its own). */
+ if(request->command==2 || request->command==6 || (request->command>=9 && request->command<=13)) {
+  if(request->send_pid || request->send_count || request->receive_count || request->copy_count ||
+     request->input_object_count || request->receive_mode || request->argument_size>16)
+   boundary("audout-command-layout",&state,state.pc);
+  static float volume[16]={1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+  switch(request->command) {
+  case 2: {  /* StopAudioOut */
+   MMRESULT result=wave->running ? wave_output_pause(wave) : MMSYSERR_NOERROR;
+   if(result) {printf("AUDOUT stop result=%u\n",result);boundary("audout-host-stop",&state,state.pc);}
+   puts("AUDOUT stopped");reply_result(buffer,request,0);return;
+  }
+  case 6: {  /* ContainsAudioOutBuffer(tag) -> bool */
+   uint64_t tag=0;if(request->argument_size>=8) memcpy(&tag,request->arguments,8);
+   unsigned found=0;for(unsigned i=0;i<wave->count;i++) found|=wave->buffers[(wave->head+i)%32].tag==tag;
+   reply_value(buffer,request,found);return;
+  }
+  case 9: reply_value(buffer,request,wave->count);return;  /* GetAudioOutBufferCount */
+  case 10: {  /* GetAudioOutPlayedSampleCount */
+   uint64_t played=0;if(wave->appended && wave_output_position(wave,&played)) played=0;
+   reply_wide_value(buffer,request,played);return;
+  }
+  case 11: {  /* FlushAudioOutBuffers -> bool: the queued buffers are done (released at the next collect) */
+   unsigned had=wave->count;
+   if(had && wave->handle) {wave_api.reset(wave->handle);wave->position_epoch=0;wave->last_position=0;wave->appended=0;wave->play_end=0;}
+   SetEvent(wave->completion);
+   printf("AUDOUT flushed %u buffers\n",had);reply_value(buffer,request,had!=0);return;
+  }
+  case 12: {  /* SetAudioOutVolume(f32) */
+   if(request->argument_size>=4) memcpy(&volume[id-1],request->arguments,4);
+   printf("AUDOUT volume %.2f\n",(double)volume[id-1]);reply_result(buffer,request,0);return;
+  }
+  case 13: {uint32_t bits;memcpy(&bits,&volume[id-1],4);reply_value(buffer,request,bits);return;}  /* GetAudioOutVolume */
+  }
+ }
+ if(request->command!=4) {printf("AUDOUT command %u not implemented\n",request->command);boundary("audout-stream-command",&state,state.pc);}
  if(request->argument_size>8 || request->send_pid || request->send_count || request->receive_count ||
     request->copy_count || request->input_object_count || request->receive_mode)
   boundary("audout-event-layout",&state,state.pc);

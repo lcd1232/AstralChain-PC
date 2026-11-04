@@ -563,6 +563,57 @@ static void draw_slot(Canvas *cv, const Slot *sl) {
     }
 }
 
+/* ------------------------------------------------------------------------------------------------ the backplate */
+/* The atlas holds each icon twice: alpha is the white icon (letters cut out), the colour channels its backplate, the
+ * same shape filled and grown by ~2.5 px, which the game draws first in a dark tint: the outline around the icon and
+ * the colour seen through its cut-out letters. Writing white over the whole slot made that plate the slot's rectangle
+ * (square dark corners behind round PlayStation and Xbox buttons). Here the plate is made from the new icon: its shape
+ * with the holes filled, grown with a soft edge, written over the slot and a margin (the original's plate reached
+ * past the slot). */
+enum { PLATE_MARGIN = 4 };
+static void write_plate(uint8_t *data, uint32_t row, const Slot *sl) {
+    int x0 = sl->x0 - PLATE_MARGIN, y0 = sl->y0 - PLATE_MARGIN, x1 = sl->x1 + PLATE_MARGIN, y1 = sl->y1 + PLATE_MARGIN;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= ATLAS_W) x1 = ATLAS_W - 1;
+    if (y1 >= ATLAS_H) y1 = ATLAS_H - 1;
+    int w = x1 - x0 + 1, h = y1 - y0 + 1;
+    uint8_t *solid = calloc((size_t)w * h, 1), *outside = calloc((size_t)w * h, 1);
+    int *stack = malloc(sizeof(int) * (size_t)w * h * 4);
+    if (!solid || !outside || !stack) { free(solid); free(outside); free(stack); return; }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) solid[y * w + x] = data[(size_t)(y0 + y) * row + (size_t)(x0 + x) * 4 + 3] >= 32;
+    /* holes: whatever the region's border cannot reach without crossing the shape */
+    int n = 0;
+    for (int x = 0; x < w; x++) { stack[n++] = x; stack[n++] = (h - 1) * w + x; }
+    for (int y = 0; y < h; y++) { stack[n++] = y * w; stack[n++] = y * w + w - 1; }
+    while (n) {
+        int i = stack[--n];
+        if (outside[i] || solid[i]) continue;
+        outside[i] = 1;
+        int x = i % w, y = i / w;
+        if (x > 0) stack[n++] = i - 1;
+        if (x < w - 1) stack[n++] = i + 1;
+        if (y > 0) stack[n++] = i - w;
+        if (y < h - 1) stack[n++] = i + w;
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float best = 9;
+            for (int j = -3; j <= 3; j++)
+                for (int i = -3; i <= 3; i++) {
+                    int xx = x + i, yy = y + j;
+                    if (xx < 0 || yy < 0 || xx >= w || yy >= h || outside[yy * w + xx]) continue;
+                    float d = sqrtf((float)(i * i + j * j));
+                    if (d < best) best = d;
+                }
+            float v = best <= 1.0f ? 255.0f : 255.0f * (3.0f - best) / 2.0f;
+            uint8_t *p = data + (size_t)(y0 + y) * row + (size_t)(x0 + x) * 4;
+            p[0] = p[1] = p[2] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    free(solid); free(outside); free(stack);
+}
+
 /* ---------------------------------------------------------------------------------------------------- the hooks */
 int texpatch_identify(const void *texture) {
     const NvnTexture *t = texture;
@@ -613,10 +664,10 @@ void texpatch_apply(int id, uint32_t level, uint8_t *data, uint32_t w, uint32_t 
                 for (int j = 0; j < SS; j++)
                     for (int i2 = 0; i2 < SS; i2++) sum += cv.c[(y * SS + j) * cv.w + x * SS + i2];
                 uint8_t *p = data + (size_t)(sl->y0 + y) * row + (size_t)(sl->x0 + x) * 4;
-                p[0] = p[1] = p[2] = 255;
                 p[3] = (uint8_t)(sum / (SS * SS));
             }
         free(cv.c);
+        write_plate(data, row, sl);
     }
     dump(data, row, "atlas-after.rgba");
 }

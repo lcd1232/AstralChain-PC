@@ -63,7 +63,18 @@ static void pl_load_fonts(void) {
  static int loaded;if(loaded) return;loaded=1;
  char custom[MAX_PATH];DWORD n=GetEnvironmentVariableA("AC_FONT",custom,sizeof(custom));
  const char *standard[]={n && n<sizeof(custom) ? custom : NULL,
+#ifdef __linux__
+  /* TrueType (glyf) sans faces where the common distributions put them (Arch / SteamOS, Debian / Ubuntu, Fedora);
+   * the Linux launcher passes fontconfig's choice as AC_FONT first */
+  "/usr/share/fonts/noto/NotoSans-Regular.ttf","/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+  "/usr/share/fonts/google-noto/NotoSans-Regular.ttf","/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
+  "/usr/share/fonts/TTF/DejaVuSans.ttf","/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+  "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+  "/usr/share/fonts/liberation/LiberationSans-Regular.ttf","/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+  "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf"};
+#else
   "C:/Windows/Fonts/YuGothR.ttc","C:/Windows/Fonts/YuGothM.ttc","C:/Windows/Fonts/arial.ttf"};
+#endif
  for(size_t i=0;i<sizeof(standard)/sizeof(standard[0]) && !pl_fonts[0].data;i++) if(standard[i]) pl_load(standard[i],&pl_fonts[0]);
  if(!pl_fonts[0].data) boundary("pl-no-system-font",&state,state.pc);
  n=GetEnvironmentVariableA("AC_FONT_EXT",custom,sizeof(custom));

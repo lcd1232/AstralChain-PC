@@ -19,6 +19,11 @@ shaders, keys or firmware, and never will. Everything the setup produces comes f
 > **AI disclosure.** Most of the code, tooling, reverse engineering and documentation here was written by Claude
 > (Anthropic) through Claude Code, directed and tested by the repository owner. It is shared as-is as a fan project.
 
+## Linux and Steam Deck
+
+A native Linux build (no Proton or Wine) with a setup and launcher AppImage, Steam Deck defaults and an **Add to
+Steam** button: see [linux/README.md](linux/README.md).
+
 ## Status
 
 | | |

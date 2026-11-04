@@ -17,13 +17,14 @@ import subprocess
 
 from .native_build import FLAGS, digest_file, run_compiler
 from .shader_build import prepare_translator
+from . import host
 
 LAS = Path(__file__).parent/'runtime/las'
 PROJECT = Path(__file__).resolve().parent.parent
 VULKAN_HEADERS = PROJECT/'third_party/Vulkan-Headers/include'
 VMA = PROJECT/'third_party/VulkanMemoryAllocator/include'
-GLSLANG = PROJECT/'tools/glslang/bin/glslang.exe'
-VULKAN_DLL = Path('C:/Windows/System32/vulkan-1.dll')
+GLSLANG = host.GLSLANG
+VULKAN_DLL = host.vulkan_library() if host.LINUX else Path('C:/Windows/System32/vulkan-1.dll')
 OBJECT_LAYER = ('nvn/objects.c', 'nvn/cmdbuf.c', 'nvn/formats.c', 'nvn/tegra.c', 'nvn/astc.c')
 VULKAN_LAYER = ('nvn/vulkan/device.c', 'nvn/vulkan/exec.c', 'nvn/vulkan/textures.c', 'nvn/vulkan/shaders.c',
                 'nvn/vulkan/spirv_cache.c', 'nvn/vulkan/astc_gpu.c', 'nvn/vulkan/bc7_gpu.c',
@@ -67,6 +68,8 @@ def build_nvn_objects(compiler, reference, cache, backend='null'):
     provenance={'compiler_sha256':digest_file(compiler),'flags':FLAGS,'backend':backend,
                 'inputs':{p.relative_to(LAS).as_posix():digest_file(p) for p in inputs},
                 'cpu_h':digest_file(reference/'runtime/cpu.h')}
+    if host.LINUX:
+        provenance['posix']={p.name:digest_file(p) for p in sorted(host.POSIX.glob('*.h'))}
     if backend=='vulkan':
         provenance['vma_sha256']=digest_file(VMA/'vk_mem_alloc.h')
         provenance['vulkan_core_sha256']=digest_file(VULKAN_HEADERS/'vulkan/vulkan_core.h')
@@ -82,16 +85,16 @@ def build_nvn_objects(compiler, reference, cache, backend='null'):
         name=source.name if source.is_relative_to(folder) else source.relative_to(LAS).as_posix().replace('/','_')
         return folder/(name+'.obj')
     objects=[object_of(s) for s in sources]
-    library=folder/'libvulkan-1.a'
+    library=VULKAN_DLL if host.LINUX else folder/'libvulkan-1.a'
     link=[str(library),'-lc++'] if backend=='vulkan' else []
     if manifest.is_file():
         saved=json.loads(manifest.read_text(encoding='utf-8'))
-        expected=objects+([library] if backend=='vulkan' else [])
+        expected=objects+([library] if backend=='vulkan' and not host.LINUX else [])
         if saved.get('key')!=key or not all(o.is_file() and saved['objects'].get(o.name)==digest_file(o) for o in expected):
             raise ValueError('Cached NVN object integrity mismatch')
         return objects,link
     folder.mkdir(parents=True,exist_ok=True)
-    common=['-I',str(LAS),'-I',str(reference/'runtime')]
+    common=[*host.shim_include(),*host.freetype_include(),'-I',str(LAS),'-I',str(reference/'runtime')]
     if backend=='vulkan':
         prepare_translator(reference,folder/'translator')
         common+=['-I',str(LAS/'shim'),'-I',str(VULKAN_HEADERS),'-I',str(VMA),
@@ -100,7 +103,7 @@ def build_nvn_objects(compiler, reference, cache, backend='null'):
     for source,obj in zip(sources,objects):
         backend_file=source.is_relative_to(folder) or 'vulkan' in source.parts or source.name in VULKAN_LAYER
         if source.suffix=='.cpp':
-            command=[str(compiler),'c++','-target','x86_64-windows-gnu','-O1','-std=c++17',*common,'-c',str(source),'-o',str(obj)]
+            command=[str(compiler),'c++',*host.target(),'-O1','-std=c++17',*common,'-c',str(source),'-o',str(obj)]
         else:
             extra=['-include',str(LAS/'las_compat.h')] if backend_file else []
             command=[str(compiler),'cc',*FLAGS,*extra,*common,'-c',str(source),'-o',str(obj)]
@@ -109,12 +112,12 @@ def build_nvn_objects(compiler, reference, cache, backend='null'):
         if result.returncode:
             (folder/'compiler.log').write_text('\n'.join(log),encoding='utf-8')
             result.check_returncode()
-    if backend=='vulkan':
+    if backend=='vulkan' and not host.LINUX:
         definition=folder/'vulkan-1.def'
         definition.write_text('LIBRARY vulkan-1.dll\nEXPORTS\n'+''.join(n+'\n' for n in _pe_exports(VULKAN_DLL)),encoding='ascii')
         subprocess.run([str(compiler),'dlltool','-m','i386:x86-64','-d',str(definition),'-l',str(library)],check=True,timeout=120)
     (folder/'compiler.log').write_text('\n'.join(log),encoding='utf-8')
-    recorded=objects+([library] if backend=='vulkan' else [])
+    recorded=objects+([library] if backend=='vulkan' and not host.LINUX else [])
     manifest.write_text(json.dumps({'key':key,'objects':{o.name:digest_file(o) for o in recorded},
                                     'provenance':provenance},indent=2)+'\n',encoding='utf-8')
     return objects,link

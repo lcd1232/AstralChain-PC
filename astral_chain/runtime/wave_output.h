@@ -94,6 +94,9 @@ static MMRESULT wave_output_pause(WaveOutput *output) {
  return result;
 }
 static MMRESULT wave_output_position(WaveOutput *output,uint64_t *frames);
+/* (AC_AVSYNC_LOG, host_runtime.c.in svc #0xB1) how far the sound's content is behind real time: the time the queue
+ * ran dry, less the sound skipped to catch up */
+static double wave_content_lag;
 static MMRESULT wave_output_append(WaveOutput *output,uint64_t tag,const void *pcm,size_t size) {
  if(!output->handle || !output->ready)return MMSYSERR_INVALHANDLE;
  if(!pcm || !size || size>16u*1024*1024 || size%output->format.nBlockAlign)return MMSYSERR_INVALPARAM;
@@ -128,6 +131,7 @@ static MMRESULT wave_output_append(WaveOutput *output,uint64_t tag,const void *p
    output->owed-=(double)skip/output->format.nAvgBytesPerSec;if(output->owed<0.0005) output->owed=0;
    output->skipped+=(double)skip/output->format.nAvgBytesPerSec;
   }
+  wave_content_lag=output->starved-output->skipped;
   output->queued_then=output->play_end>now ? output->play_end-now : 0;
   output->last_append=now;
   if(output->play_end<now)output->play_end=now;

@@ -2,7 +2,9 @@
 // Astral Chain: presents into the runtime's Win32 window (nvn_host_window) instead of an SDL window; the
 // Link's Awakening widescreen, menu, output-scale and test hooks are removed (see runtime/las/README.md).
 #include <windows.h>
+#ifndef WIN32_POSIX
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -42,8 +44,16 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     const char *ext[16];
     uint32_t n_ext = 0;
+#ifdef WIN32_POSIX
+    // Linux: the surface extensions of the SDL window system in use (Wayland or X11)
+    uint32_t n_sdl = 0;
+    const char *const *sdl_ext = win32_posix_vulkan_instance_extensions(&n_sdl);
+    for (uint32_t i = 0; i < n_sdl && n_ext < 12; i++) ext[n_ext++] = sdl_ext[i];
+    if (!n_sdl) ext[n_ext++] = VK_KHR_SURFACE_EXTENSION_NAME;
+#else
     ext[n_ext++] = VK_KHR_SURFACE_EXTENSION_NAME;
     ext[n_ext++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#endif
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -808,15 +818,25 @@ static void exit_handler(void) {
     fflush(stderr);
 }
 
+static void create_surface(void) {
+#ifdef WIN32_POSIX
+    uint64_t surface = 0;
+    if (!win32_posix_vulkan_surface(window, g_vk.inst, &surface)) FATAL("no Vulkan surface for the window\n");
+    g_vk.surface = (VkSurfaceKHR)surface;
+#else
+    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
+    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+#endif
+}
+
 static void window_init(void) {
     if (window) return;
     window = (HWND)nvn_host_window();
     if (!window) FATAL("no host window for Vulkan presentation\n");
     atexit(exit_handler);
     create_instance();
-    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
-    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+    create_surface();
     pick_device();
     create_device();
     create_swapchain();
@@ -850,9 +870,7 @@ void vk_init_for_warm(void) {
     window = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 16, 16, NULL, NULL, wc.hInstance, NULL);
     if (!window) FATAL("no window for the GPU warm-up\n");
     create_instance();
-    VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                                      .hinstance = GetModuleHandleW(NULL), .hwnd = window};
-    VK_CHECK(vkCreateWin32SurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+    create_surface();
     pick_device();
     create_device();
     vk_exec_init();

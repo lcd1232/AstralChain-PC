@@ -1,0 +1,21 @@
+@nsobid-4B159F0F7A360669738390EE8657B4F0
+// Astral Chain v1.0.1: pre-rendered movies (the opening cutscene: 1600x900, 30 FPS, 8726 frames) keep their picture
+// with their sound.
+//
+// The movie player's frame clock (run time 0x70007103E0; its clock, 0x7000710FB0, is the system
+// tick in ms) re-anchored itself when the picture fell behind it by more than twice [player+0x64C] (66 ms): the start
+// time [+0x644] was cleared and taken again from the frame then due, so the sound, which plays on by itself, stayed
+// ahead by the whole delay for the rest of the movie. One stall over 132 ms (a slow first frame, an area loading)
+// left 0.65-1.4 s between the voices and the lips in the opening cutscene, different at each start (measured
+// against two Switch recordings). Here the late picture keeps its clock: it is "due" until it has caught up, so the
+// player decodes the next frames back to back and the picture rejoins its sound.
+//
+// 0x7004E8 (run time 0x70007104E8; this file's offsets + 0x7000010000 are run-time addresses, as for the svc #0xB1
+// of cutscene-catchup-1.0.1.pchtxt at 0x7000A1EFD4): b.le 0x700071040C (the frame is due; past twice the threshold:
+// fall through and clear the start time) -> b 0x700071040C.
+
+@flag offset_shift 0x100
+
+@enabled
+007004E8 C9FFFF17 // b 0x700071040C: a late frame is due (was b.le, else clear the start time)
+@stop

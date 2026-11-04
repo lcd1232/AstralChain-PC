@@ -26,6 +26,17 @@ static const struct {const char *name;NvnHostFunction host;} nvn_host_table[]={
 /* Vendored LASRecomp NVN implementations (runtime/las) register through COFF
  * section .hle$m. These markers sort before and after it within .hle. */
 typedef struct {const char *name;NvnHostFunction fn;} NvnLinkedEntry;
+#ifdef __linux__
+/* ELF: no '$' sorting; the entries' section ac_nvn_hle (las/hle.h) is bounded by the linker's symbols. */
+extern const NvnLinkedEntry __start_ac_nvn_hle[] __attribute__((weak)),__stop_ac_nvn_hle[] __attribute__((weak));
+static NvnHostFunction nvn_linked_lookup(const char *name) {
+ const NvnLinkedEntry *first=__start_ac_nvn_hle,*last=__stop_ac_nvn_hle;
+ __asm__("" : "+r"(first), "+r"(last));
+ for(const NvnLinkedEntry *e=first;e && e<last;e++)
+  if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
+ return NULL;
+}
+#else
 __attribute__((used,section(".hle$a"))) static const NvnLinkedEntry nvn_linked_first={0,0};
 __attribute__((used,section(".hle$z"))) static const NvnLinkedEntry nvn_linked_last={0,0};
 static NvnHostFunction nvn_linked_lookup(const char *name) {
@@ -33,6 +44,7 @@ static NvnHostFunction nvn_linked_lookup(const char *name) {
   if(e->name && e->fn && !strcmp(e->name,name))return e->fn;
  return NULL;
 }
+#endif
 /* Bounded NUL-terminated guest string inside one readable region. */
 static int nvn_guest_name(uint64_t address,char *out) {
  if(!address)return 0;
@@ -234,7 +246,16 @@ uint64_t plat_now_ns(void) {
  QueryPerformanceCounter(&now);
  return (uint64_t)((unsigned __int128)now.QuadPart*1000000000u/(uint64_t)frequency.QuadPart);
 }
+#ifdef __linux__
+/* Linux: the kernel's precise absolute sleep on plat_now_ns's clock (QueryPerformanceCounter is CLOCK_MONOTONIC), not
+ * a Sleep(0) spin for the whole wait. */
+void plat_sleep_until_ns(uint64_t t) {
+ struct timespec ts={(time_t)(t/1000000000u),(long)(t%1000000000u)};
+ while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,NULL)==EINTR) {}
+}
+#else
 void plat_sleep_until_ns(uint64_t t) {for(uint64_t now=plat_now_ns();now<t;now=plat_now_ns())Sleep(0);}
+#endif
 /* Background work (texture warm-up decodes, cache saves) below normal priority: it must not delay the game's sound thread. */
 void plat_thread_background(void) {SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);}
 /* Pages of [addr,addr+size) written by the CPU since the last query of them
@@ -416,10 +437,18 @@ void *nvn_host_window(void) {
 }
 /* Display pacing: 60 Hz vsync grid in rt_ticks (19.2 MHz). Each present waits for
  * the first vsync at least `interval` refreshes after the previous present.
- * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1). */
+ * AC_PRESENT_INTERVAL overrides the game's interval (experiments, e.g. 1).
+ * AC_FPS_LIMIT=<20..60> paces on a grid of that rate instead of 60 Hz (a steady 40 fps on handhelds such as the
+ * Steam Deck; the game's step follows the measured frame time, so it runs at the right speed). */
 void nvn_present_pace(int interval) {
  static int override=-2;
- if(override==-2) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;}
+ static uint64_t period=320000; /* 19.2 MHz / 60 Hz */
+ if(override==-2) {
+  char v[16];DWORD n=GetEnvironmentVariableA("AC_PRESENT_INTERVAL",v,sizeof(v));override=n && n<sizeof(v) ? atoi(v) : -1;
+  n=GetEnvironmentVariableA("AC_FPS_LIMIT",v,sizeof(v));
+  int limit=n && n<sizeof(v) ? atoi(v) : 60;
+  if(limit>=20 && limit<60) {period=19200000ull/(uint64_t)limit;printf("NVN frame limit %d fps\n",limit);}
+ }
  static unsigned presents;
  if(!(++presents%60)) {fflush(stdout);fflush(stderr);} /* long runs end by timeout; keep the log current */
  static int logged_interval=-1;
@@ -427,10 +456,9 @@ void nvn_present_pace(int interval) {
  if(override>=0) interval=override;
  /* AC_CUTSCENE_FPS=30: cutscenes at 30 FPS, as in the unmodified game (svc #0xB1 in host_runtime.c.in). */
  extern int cutscene_mode;
- if(cutscene_mode && interval>0 && interval<2) interval=2;
+ if(cutscene_mode && interval>0 && interval<2 && period==320000) interval=2;
  if(interval<=0) return;
  static uint64_t origin,last_vsync;
- const uint64_t period=320000; /* 19.2 MHz / 60 Hz */
  uint64_t now=rt_ticks();
  if(!origin) {origin=now;last_vsync=0;return;}
  /* Adaptive: a frame that missed its slot (last + interval) is shown at once
@@ -451,7 +479,15 @@ void nvn_present_pace(int interval) {
  unsigned others=0;
  for(unsigned i=0;i<33;i++) if(i!=current_thread && guest_threads[i].status!=THREAD_UNUSED &&
     guest_threads[i].status!=THREAD_CREATED && guest_threads[i].status!=THREAD_EXITED) others++;
- if(!others) {kunlock();while(rt_ticks()<target) Sleep(0);return;}
+ if(!others) {
+  kunlock();
+#ifdef __linux__
+  while(rt_ticks()<target) plat_sleep_until_ns((uint64_t)(((__uint128_t)target*1000000000u+19199999)/19200000));
+#else
+  while(rt_ticks()<target) Sleep(0);
+#endif
+  return;
+ }
  guest_threads[current_thread].wake_tick=target;
  guest_threads[current_thread].status=THREAD_SLEEPING;
  (parallel_mode ? 0 : (thread_reschedule=1));
@@ -585,6 +621,7 @@ static void prof_attach(unsigned thread) {
  if((int)thread!=wanted || !GetEnvironmentVariableA("AC_PROFILE",NULL,0)) return;
  if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&prof_target,THREAD_ALL_ACCESS,FALSE,0)) return;
  {ULONG_PTR low,high;GetCurrentThreadStackLimits(&low,&high);prof_stack_low=low;prof_stack_high=high;
+#ifndef WIN32_POSIX  /* (Linux: the image is ELF; samples are recorded without their caller) */
   const uint8_t *image=(const uint8_t *)GetModuleHandleA(NULL);
   const IMAGE_NT_HEADERS64 *nt=(const IMAGE_NT_HEADERS64 *)(image+((const IMAGE_DOS_HEADER *)image)->e_lfanew);
   /* The executable sections only: data pointers on the stack are not return addresses. */
@@ -593,7 +630,9 @@ static void prof_attach(unsigned thread) {
    uint64_t lo=(uint64_t)(uintptr_t)image+sec[i].VirtualAddress,hi=lo+sec[i].Misc.VirtualSize;
    if(!prof_image_low || lo<prof_image_low) prof_image_low=lo;
    if(hi>prof_image_high) prof_image_high=hi;
-  }}
+  }
+#endif
+ }
  HANDLE t=CreateThread(NULL,0,prof_thread,NULL,0,NULL);if(t)CloseHandle(t);
  printf("PROFILE sampling the host thread of guest thread %u\n",thread);
 }

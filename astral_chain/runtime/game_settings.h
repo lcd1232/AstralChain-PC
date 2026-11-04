@@ -7,6 +7,9 @@
  * once at the start (getenv, GetEnvironmentVariableA) needs nothing more. A setting the menu changes while the game
  * runs is read through setting_get / setting_int by its reader, which reads it again when settings_version changes
  * (the environment is not written after the start: other threads read it). settings_save writes every value. */
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #define SETTINGS_MAX 64
 typedef struct { char name[40]; char value[64]; unsigned char fixed,unset; } Setting;  /* (unset: not written) */
 static Setting settings_tab[SETTINGS_MAX];
@@ -63,6 +66,12 @@ void settings_load(void) {
  }
  fclose(f);
  printf("[settings] %u from %s (%u fixed by the environment)\n",loaded,settings_path,fixed);
+#ifdef __linux__
+ /* (AC_DEBUG_PTRACE=1 in the file too: a profiler or eu-stack may attach although not this process's parent; the
+  * environment's is handled in posix/w32_main.c) */
+ const char *ptrace_env=getenv("AC_DEBUG_PTRACE");
+ if(ptrace_env && ptrace_env[0]=='1') prctl(PR_SET_PTRACER,PR_SET_PTRACER_ANY,0,0,0);
+#endif
 }
 
 /* The value (the file's or the menu's, else the environment's) into buf; 0 when there is none. Any thread. */

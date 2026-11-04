@@ -57,6 +57,7 @@ static unsigned hid_vibration_index(uint32_t handle) {
  return ((style-3)*9+slot)*2+device;
 }
 typedef struct { uint64_t sample,buttons; int32_t lx,ly,rx,ry; uint32_t attributes,reserved; } HidSample;
+static void hid_rumble_set(unsigned device,float low,float high);  /* (below: the pads' motors) */
 static void hid_accept_vibration(const IpcRequest *request) {
  if(!request->send_pid || request->argument_size<32 || request->argument_size>40 ||
     request->send_count || request->receive_count || request->copy_count || request->input_object_count)
@@ -75,10 +76,8 @@ static void hid_accept_vibration(const IpcRequest *request) {
    printf("HID vibration handle=0x%x value %u out of range (bits 0x%08x): ignored\n",handle,i,bits);
   }
  }
- /* The current keyboard backend has no physical actuator. Accept the command
-  * for a valid virtual device without fabricating a connection or actual output. */
- HOT_LOG("HID vibration handle=0x%x low=%g/%g high=%g/%g (no host actuator)\n",
-  handle,value[0],value[1],value[2],value[3]);
+ HOT_LOG("HID vibration handle=0x%x low=%g/%g high=%g/%g\n",handle,value[0],value[1],value[2],value[3]);
+ hid_rumble_set((handle>>16)&1,value[0],value[2]);
 }
 typedef struct { uint64_t sequence; HidSample state; } HidSampleSlot;
 typedef struct { uint64_t unused,capacity,tail,count; HidSampleSlot slots[17]; } HidRing;
@@ -140,14 +139,52 @@ static DWORD WINAPI xinput_probe(void *argument) {
  }
  return 0;
 }
+/* Vibration: the game sends HD Rumble values for each half of the controller (the device byte of the handle: left,
+ * right), a low band (~160 Hz, a thump) and a high band (~320 Hz, a buzz), each an amplitude of about 0 to 1 and a
+ * frequency. A pad has a heavy motor on the left and a light one on the right: the low bands of both halves drive the
+ * left motor, the high bands the right one, on every connected pad (XInputSetState: SDL_RumbleGamepad on Linux, which
+ * the Xbox, PlayStation and Steam controllers and the Steam Deck support). The motors are weaker than the Switch's
+ * actuators at small amplitudes, so the amplitude's square root drives them. A value lasts until the game sends
+ * another, and SDL stops a motor after a second: hid_xinput sends it again every half second while it is not zero.
+ * AC_VIBRATION=<0..200>: the strength in percent (the in-game menu; 0: off). */
+static DWORD (WINAPI *xinput_set_state)(DWORD,uint16_t*);
+static float hid_rumble_amp[2][2];  /* [device][low, high] */
+static uint16_t hid_rumble_sent[2];
+static uint64_t hid_rumble_tick;
+static int hid_rumble_strength=100;
+static void hid_rumble_send(int force) {
+ SETTING_LIVE(hid_rumble_strength,"AC_VIBRATION",100);
+ float k=hid_rumble_strength<0 ? 0.0f : hid_rumble_strength/100.0f;
+ uint16_t motor[2];
+ for(unsigned band=0;band<2;band++) {
+  float a=hid_rumble_amp[0][band]>hid_rumble_amp[1][band] ? hid_rumble_amp[0][band] : hid_rumble_amp[1][band];
+  float v=a>0 ? sqrtf(a)*k : 0.0f;
+  motor[band]=v>=1.0f ? 65535 : (uint16_t)(v*65535.0f);
+ }
+ uint64_t now=GetTickCount64();
+ int changed=motor[0]!=hid_rumble_sent[0] || motor[1]!=hid_rumble_sent[1];
+ if(!changed && !(force && (motor[0] || motor[1]) && now-hid_rumble_tick>=500)) return;
+ hid_rumble_sent[0]=motor[0];hid_rumble_sent[1]=motor[1];hid_rumble_tick=now;
+ if(!xinput_set_state) return;
+ LONG pads=xinput_pads;
+ for(int pad=0;pad<4;pad++) if(pads&(1<<pad)) {uint16_t m[2]={motor[0],motor[1]};xinput_set_state((DWORD)pad,m);}
+}
+static void hid_rumble_set(unsigned device,float low,float high) {
+ /* (finite and not negative: a bad value was seen in the File 01 boss fight; the console clamps) */
+ hid_rumble_amp[device][0]=low>0 && low<4 ? low : 0;
+ hid_rumble_amp[device][1]=high>0 && high<4 ? high : 0;
+ hid_rumble_send(0);
+}
 static void hid_xinput(HidSample *sample) {
  static int loaded;
  if(!loaded) {
   loaded=1;HMODULE x=LoadLibraryExW(L"xinput1_4.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
   if(x) xinput_get_state=(DWORD (WINAPI*)(DWORD,HidXinputState*))GetProcAddress(x,"XInputGetState");
+  if(x) xinput_set_state=(DWORD (WINAPI*)(DWORD,uint16_t*))GetProcAddress(x,"XInputSetState");
   if(xinput_get_state) {HANDLE t=CreateThread(NULL,0,xinput_probe,NULL,0,NULL);if(t) CloseHandle(t);}
  }
  if(!xinput_get_state) return;
+ hid_rumble_send(1);  /* (a vibration lasting longer than SDL's second) */
  static const struct {uint16_t xinput;unsigned bit;} map[]={
   {0x1000,1},{0x2000,0},{0x4000,3},{0x8000,2},{0x0040,4},{0x0080,5},{0x0100,6},{0x0200,7},
   {0x0010,10},{0x0020,11},{0x0004,12},{0x0001,13},{0x0008,14},{0x0002,15}};
@@ -230,6 +267,7 @@ static void hid_publish(uint64_t now,int focused) {
  if(previous!=(connected ? 1u : 0u) && hid_style_events[0] && !SetEvent(hid_style_events[0]))
   boundary("hid-style-event",&state,state.pc);
  HidSample sample={0};sample.sample=++hid_sampling;sample.attributes=connected ? 3 : 0;
+ int gated=0;uint64_t raw=0;
  mouse_wheel_step(now);
  if(connected && focused) {
   hid_keys_load();
@@ -257,7 +295,23 @@ static void hid_publish(uint64_t now,int focused) {
   if(scripted&(1ull<<17)) sample.ly=32767;
   if(scripted&(1ull<<19)) sample.ly=-32767;
   /* (Minus and Plus together open the menu; while it is open, and until what was held is let go, no game input) */
-  if(menu_pad_gate && menu_pad_gate(sample.buttons,sample.lx,sample.ly)) {sample.buttons=0;sample.lx=sample.ly=sample.rx=sample.ry=0;}
+  gated=menu_pad_gate && menu_pad_gate(sample.buttons,sample.lx,sample.ly);
+  raw=sample.buttons;
+  if(gated) {sample.buttons=0;sample.lx=sample.ly=sample.rx=sample.ry=0;}
+ }
+ /* AC_INPUT_LOG=1: each change of the buttons the game gets (hex, bit 8 ZL, bit 9 ZR), with the time and why input
+  * was held back (window not focused: no pad or keyboard input; the in-game menu open or its buttons still held). */
+ {
+  static int on=-1;static uint64_t last=~0ull,origin;static int last_focus=-1,last_gated=-1;
+  if(on<0) {char v[8];DWORD n=GetEnvironmentVariableA("AC_INPUT_LOG",v,sizeof(v));on=n && n<sizeof(v) && atoi(v);}
+  if(on && (sample.buttons!=last || focused!=last_focus || gated!=last_gated)) {
+   if(!origin) origin=now;
+   printf("HID input t=%.3f buttons=0x%llx",(double)(now-origin)/19200000.0,(unsigned long long)sample.buttons);
+   if(!focused) printf(" (window not focused)");
+   if(gated) printf(" (held back by the menu; pressed 0x%llx)",(unsigned long long)raw);
+   printf("\n");fflush(stdout);
+   last=sample.buttons;last_focus=focused;last_gated=gated;
+  }
  }
  hid_ring_write((HidRing*)(npad+0x28),&sample);
  hid_ring_write((HidRing*)(npad+0x1408),&sample);
